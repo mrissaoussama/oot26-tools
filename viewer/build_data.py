@@ -9,6 +9,31 @@ WALL = re.compile(r'AirWall|Airwall')
 # FallDown_Item only detects objects/animals; FallDown (incl. Mountain/GanonCastle variants) detects the player.
 ZONE_LOGIC = [('Gimmick_AreaContact_FallDown_Item', None), ('Gimmick_AreaContact_FallDown', 'void'),
               ('InvalidateRestartArea', 'norespawn'), ('Whirlpool', 'whirlpool')]
+# Scene-specific area modules (e.g. Haunted Wasteland quicksand) are classified by the nodes inside the logic file.
+MODULE_RULES = [(b'GiveAbyssItem', None), (b'FallDown_Item', None), (b'SandAbyss', 'void', 'Quicksand'),
+                (b'OutAreaCheck', 'safepath', 'Safe path (leaving every one of these sends you back)'), (b'GiveAbyssActor', 'void', 'Void (scripted)'),
+                (b'InvalidateRestartPos', 'norespawn', 'No respawn here')]
+_modules = None
+
+
+def module_kind(logic):
+    """(kind, label) for a logic module path by scanning the AINB for known node names."""
+    global _modules
+    if _modules is None:
+        _modules = {}
+        for d, _, fs in os.walk(romfs.ROOT):
+            for f in fs:
+                if '.logic.module.ainb' in f: _modules[f.split('.')[0]] = os.path.join(d, f)
+    f = _modules.get(logic.split('/')[-1].split('.')[0])
+    if not f: return None
+    b = open(f, 'rb').read()
+    if f.endswith('.zs'): b = romfs.dec(b)
+    for rule in MODULE_RULES:
+        if rule[0] in b and (rule[1] is None or b'Player' in b):
+            return (rule[1], rule[2]) if rule[1] else None
+    return None
+
+
 ACTOR_KINDS = ('Enemy_', 'Npc_', 'Animal_', 'Item_', 'Obj_Rupee', 'Obj_Heart', 'Obj_FairySpirit')
 OBJ_KEEP = ('Obj_', 'DgnObj_', 'FldObj_', 'TBox_')
 OBJ_SKIP = ('Npc_', 'Enemy_', 'Animal_', 'Item_', 'Dm_', 'EftLoc', 'Area', 'DestinationAnchor', 'Event', 'Sound',
@@ -173,6 +198,10 @@ def build(progress=print):
                                     'polys': place(box({'OffsetTranslation': {'X': 0, 'Y': 0.5, 'Z': 0}}), a)})
                 continue
             kind = next((k for pat, k in ZONE_LOGIC if pat in logic), False)
+            label = None
+            if kind is False and '/Module/' in logic:
+                mk = module_kind(logic)
+                if mk: kind, label = mk
             if not kind: continue
             for ref in g.get('References', []):
                 a = actors.get(ref.get('Reference'))
@@ -184,7 +213,7 @@ def build(progress=print):
                     polys = place(cylinder({'CenterA': {'Y': 1}, 'CenterB': {'Y': -1}, 'Radius': 1.0}), {**a, 'Translate': a.get('Translate', [0, 0, 0])})
                 else:
                     polys = place(box({'OffsetTranslation': {'X': 0, 'Y': 0.5, 'Z': 0}}), a)
-                out.append({'scene': scene, 'name': re.search(r'Module/([^/]+)/', logic).group(1), 'hash': a['Hash'],
+                out.append({'scene': scene, 'name': label or re.search(r'Module/([^/]+)/', logic).group(1), 'hash': a['Hash'],
                             'kind': kind, 'polys': polys})
     json.dump(out, open(os.path.join(HERE, 'geom.json'), 'w'))
     json.dump({'actors': live_actors, 'boxes': boxes, 'shapes': {k: v for k, v in shapes.items() if v}},

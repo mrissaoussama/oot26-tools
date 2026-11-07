@@ -161,13 +161,34 @@ class Game:
         if not self.write(guest, struct.pack('<I', value & 0xFFFFFFFF)):
             ce('writeInteger(%d, %d) return 1' % (self.addr['gb'] + guest, value))
 
+    def player(self):
+        """Player actor (guest address), found by name; cached while it still reads as Player."""
+        gb = self.addr.get('gb')
+        a = getattr(self, '_player', None)
+        if a:
+            np_ = self.read(gb + a + 0x20, '<Q')
+            name = self.raw(gb + np_[0], 7) if np_ and 0x2000000000 <= np_[0] < 0x2400000000 else None
+            if name == b'Player\0': return a
+        if time.time() - getattr(self, '_player_scan', 0) < 3: return None
+        self._player_scan = time.time()
+        self._player = next((a for a, (n, h) in self.actors().items() if n == 'Player'), None)
+        return self._player
+
     def state(self):
         self.refresh()
-        p = self.read(self.addr.get('linkpos'), '<3d')
-        if not p: return None
+        p = self.read(self.addr.get('linkpos'), '<3d') if self.addr.get('linkpos') else None
+        if p:
+            p = (p[0], p[1] - 0.585, p[2])
+        elif self.addr.get('gb'):
+            a = self.player()
+            q = a and self.actor_pos(a)
+            if not q: return None
+            p = q
+        else:
+            return None
         o = self.addr.get('linkobj')
         f = self.read(o + 0x328, '<3f') if o else None
-        return {'x': p[0], 'y': p[1] - 0.585, 'z': p[2], 'face': (f[2], f[0]) if f else None, 'cam': self.camera()}
+        return {'x': p[0], 'y': p[1], 'z': p[2], 'face': (f[2], f[0]) if f else None, 'cam': self.camera()}
 
     def scan_u64(self, keys, lo, hi, progress=None):
         """{key: [guest addresses]} for keys (sorted np.uint64) found in guest memory [lo, hi)."""

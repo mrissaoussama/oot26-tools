@@ -6,11 +6,12 @@ from PySide6.QtGui import QColor, QPen, QFont, QMatrix4x4, QPainter, QSurfaceFor
 from PySide6.QtOpenGL import QOpenGLShaderProgram, QOpenGLShader, QOpenGLBuffer, QOpenGLVertexArrayObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QCheckBox, QLabel, QPushButton, QComboBox, QMenu,
-                               QDialog, QDoubleSpinBox, QFormLayout, QDialogButtonBox,
+                               QDialog, QDoubleSpinBox, QFormLayout, QDialogButtonBox, QLineEdit, QListWidget, QListWidgetItem, QScrollArea,
                                QSlider, QRadioButton, QButtonGroup, QFrame, QFileDialog, QMessageBox, QProgressDialog)
 
 import romfs, havok, build_data
 from byml import Byml
+import game
 from game import Game
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +25,7 @@ KINDS = [  # key, label, rgb, alpha, shown by default
     ('conditional', 'Story-dependent terrain pieces', (255, 150, 200), 80, True),
     ('void', 'Fall-down areas (void-out or hole into a grotto)', (170, 60, 255), 80, True),
     ('loading', 'Loading zones', (140, 255, 60), 70, True),
+    ('safepath', 'Safe path areas (leaving them sends you back)', (255, 150, 40), 45, True),
     ('norespawn', 'No-respawn areas', (40, 220, 200), 60, False),
     ('whirlpool', 'Whirlpools', (30, 60, 200), 70, False),
 ]
@@ -114,6 +116,9 @@ class Data:
             tris = [fan(p) for p in polys if len(p) >= 3]
             if tris: self.shapes[n] = np.concatenate(tris)
         self.obj_info = {int(o['hash']): (o['name'], o.get('scale', [1, 1, 1])) for o in geom if o['kind'] == 'object'}
+        self.items = [(o['name'], o['kind'], o['scene'], np.concatenate([np.array(p) for p in o['polys']]).mean(0), int(o['hash']))
+                      for o in geom if o['polys']]
+        self.wall_hashes = {h for n, k, s, c, h in self.items if k == 'player'}
         self.hash_name = {int(o['hash']): o['name'] for o in geom}
         self.loading_zones = [(np.concatenate([np.array(p) for p in o['polys']]).mean(0), o['name'], o['scene'], int(o['hash']))
                         for o in geom if o['kind'] == 'loading']
@@ -146,6 +151,21 @@ class Data:
                         self.loading.add(path)
                         threading.Thread(target=self._load, args=(path, key, tiles, sc), daemon=True).start()
         return out, pending
+
+    def banc_sets(self):
+        """Scene file name -> every placement hash in it (all actors, not only the drawn ones)."""
+        if getattr(self, '_banc', None) is None:
+            out = {}
+            root = romfs.path('Banc')
+            for area in os.listdir(root) if root and os.path.isdir(root) else []:
+                folder = os.path.join(root, area)
+                if not os.path.isdir(folder): continue
+                for f in os.listdir(folder):
+                    if f.endswith('.bcett.byml.zs'):
+                        hs = {a['Hash'] for a in Byml(romfs.read('Banc', area, f)).root.get('Actors', [])}
+                        if hs: out[f.split('.')[0]] = hs
+            self._banc = out
+        return self._banc
 
     def name_of(self, h):
         for d in self.names.values():
@@ -320,12 +340,14 @@ class GLView(QOpenGLWidget):
     def pick_menu(self, e):
         h = self.pick(e.position().x(), e.position().y())
         self.app.selected = h
+        if self.pick_point is not None: self.app.target = tuple(map(float, self.pick_point))
         menu = QMenu(self)
         pt = self.pick_point
         if h:
             name = self.app.name_of(h) or 'object %x' % h
             menu.addAction('%s' % name).setEnabled(False)
             menu.addAction('Copy coords of this point (%.2f, %.2f, %.2f)' % tuple(pt), lambda: self.app.copy_coords(pt))
+            menu.addAction('Teleport Link here', lambda: self.app.teleport(pt))
             live = self.app.live_actor(h, pt)
             if live:
                 pos = self.app.game.actor_pos(live)
@@ -405,8 +427,7 @@ class GLView(QOpenGLWidget):
         if self.mode == 'free' and self.free: lx, lz = self.free[0], self.free[2]
         show = {k: cb.isChecked() for k, cb in app.showk.items()}
         height = app.only_height.isChecked()
-        ceil = app.no_ceiling.isChecked() and self.mode != 'game' and any(
-            len(d.tiles.get(sc, {})) == 1 for sc in (app.active or ()))
+        ceil = self.mode == 'top' or (app.no_ceiling.isChecked() and self.mode != 'game')
         key = (round(lx / (rng / 4)), round(lz / (rng / 4)), round(ly / 2) if height or ceil else 0, ceil, rng, tuple(sorted(show.items())),
                app.only_zone.isChecked(), height, tuple(sorted(app.active or ())), len(d.terrain),
                app.only_live.isChecked(), app.live_version, app.surface_mode.isChecked(), app.hidden_version,
@@ -603,6 +624,9 @@ class GLView(QOpenGLWidget):
 
 GIZMO_LEN = 2.0
 RUNTIME = 0xFFFF000000000000
+SKIP_ACTORS = ('Land_', 'Player', 'Weapon_', 'Armor_', 'Item_Ocarina', 'Camera', 'Event', 'Sound', 'Area', 'Post',
+               'Forbid', 'Ground', 'Interest', 'Sky', 'Weather', 'Env', 'Light', 'Fog')
+SYSTEM_ACTORS = {'Exterminator', 'SootCamera', 'PlayerCamera', 'EventCamera'}
 
 
 def _box(w, h):
@@ -628,6 +652,7 @@ class App(QWidget):
         self.hidden_version, self.obj_live_keys, self.dyn_picks, self.dyn = 0, None, [], []
         self.disabled, self.loaded, self.selected = {}, {}, None
         self.moved, self.models, self.gizmo, self.pins, self.live_all, self.live_named, self.runtime = {}, {}, None, {}, {}, {}, {}
+        self.target = None
         try:
             self.hidden_keys = np.array(json.load(open(os.path.join(HERE, 'hidden.json'))), np.uint64)
         except Exception:
@@ -648,6 +673,7 @@ class App(QWidget):
         sl.addWidget(QLabel('<b>Filters</b>'))
         self.show_actors = QCheckBox('Enemies / NPCs / animals (live)'); self.show_actors.setChecked(True); sl.addWidget(self.show_actors)
         self.show_names = QCheckBox('Actor names'); sl.addWidget(self.show_names)
+        self.show_navi = QCheckBox('Navi'); sl.addWidget(self.show_navi)
         self.only_zone = QCheckBox('Only the loaded zone'); self.only_zone.setChecked(True); sl.addWidget(self.only_zone)
         self.only_live = QCheckBox('Only things that exist right now'); self.only_live.setChecked(True); sl.addWidget(self.only_live)
         self.only_height = QCheckBox("Only walls right around Link"); sl.addWidget(self.only_height)
@@ -659,18 +685,28 @@ class App(QWidget):
                             ' &nbsp;'.join(sq(c, n) for n, c in HAZARD_COL.items()) + '<br><b>Actors:</b> ' +
                             ' &nbsp;'.join(sq((c.red(), c.green(), c.blue()), n) for n, c in ACTOR_COL.items() if n != 'Item') + '</small>')
         self.surface_mode.toggled.connect(self.legend.setVisible)
-        self.no_ceiling = QCheckBox('Hide ceilings in dungeons (orbit / top / free views)'); sl.addWidget(self.no_ceiling)
+        self.no_ceiling = QCheckBox('Hide ceilings above Link (orbit / free views; top-down always)'); sl.addWidget(self.no_ceiling)
         self.zone_pick = QComboBox(); self.zone_pick.addItem('Zone: follow the game')
         for g in self.data.groups: self.zone_pick.addItem(g)
         self.zone_pick.currentIndexChanged.connect(self.pick_zone); sl.addWidget(self.zone_pick)
         b = QPushButton('Re-detect zone'); b.clicked.connect(self.detect); sl.addWidget(b)
+        self.search = QLineEdit(); self.search.setPlaceholderText('Search this map (any name)...'); sl.addWidget(self.search)
+        self.results = QListWidget(); self.results.setFixedHeight(150); sl.addWidget(self.results)
+        self.search.textChanged.connect(self.do_search)
+        self.results.itemClicked.connect(lambda it: self.go_to(*it.data(Qt.UserRole)))
+        row = QHBoxLayout()
+        b = QPushButton('Teleport Link there'); b.clicked.connect(self.teleport_selected); row.addWidget(b)
+        b = QPushButton('Kill inv. walls'); b.setToolTip('Disable collision of every invisible wall in this area'); b.clicked.connect(self.disable_all_walls); row.addWidget(b)
+        sl.addLayout(row)
         b = QPushButton('Set romfs folder (for terrain)'); b.clicked.connect(self.pick_romfs); sl.addWidget(b)
         self.range = QSlider(Qt.Horizontal); self.range.setRange(15, 300); self.range.setValue(120)
         self.range_lbl = QLabel('Draw distance: 120 units'); sl.addWidget(self.range_lbl); sl.addWidget(self.range)
         self.range.valueChanged.connect(lambda v: self.range_lbl.setText('Draw distance: %d units' % v))
         self.info = QLabel(); self.info.setWordWrap(True); sl.addWidget(self.info)
         sl.addStretch(1)
-        lay.addWidget(side)
+        scroll = QScrollArea(); scroll.setWidget(side); scroll.setWidgetResizable(True); scroll.setFixedWidth(270)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); scroll.setStyleSheet('QScrollArea{border:0;background:#1b2026}')
+        lay.addWidget(scroll)
         self.view = GLView(self); lay.addWidget(self.view, 1)
         self.timer = QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(33)
         self.resize(1300, 820)
@@ -741,8 +777,48 @@ class App(QWidget):
         self.loaded[path] = base
         return base
 
+    def do_search(self, text):
+        """Everything in the current map whose name matches, ignoring the view filters."""
+        self.results.clear()
+        t = text.strip().lower()
+        if len(t) < 2: return
+        rows = []
+        for name, acts in self.live_named.items():
+            if t in name.lower():
+                for a in acts[:50]:
+                    p = self.game.actor_pos(a)
+                    if p and sum(map(abs, p)) > 0.01:
+                        h = next((k for k, v in self.live_all.items() if v == a), RUNTIME | a)
+                        rows.append(('%s (live)  %.0f %.0f %.0f' % (name, *p), p, h))
+        act = self.active or ()
+        for name, kind, scene, c, h in self.data.items:
+            if (not act or scene in act) and (t in name.lower() or t in kind):
+                rows.append(('%s [%s]  %.0f %.0f %.0f' % (name, kind, *c), tuple(map(float, c)), h))
+        for label, p, h in rows[:400]:
+            it = QListWidgetItem(label); it.setData(Qt.UserRole, (p, h)); self.results.addItem(it)
+
+    def go_to(self, p, h):
+        self.selected = h
+        self.target = tuple(p)
+        self.view.mode = 'free'; self.modes.button(3).setChecked(True)
+        self.view.free = [float(p[0]), float(p[1]) + 8, float(p[2]) + 12, 0.0, -0.55]
+
+    def teleport(self, p):
+        game.ce('linkTeleport(%f, %f, %f) return 1' % (p[0], p[1] + 0.5, p[2]))
+        self.zone_msg = 'teleported Link to %.1f %.1f %.1f' % tuple(p[:3])
+
+    def teleport_selected(self):
+        if self.target is not None: self.teleport(self.target)
+
+    def disable_all_walls(self):
+        hs = [h for h in self.data.wall_hashes if self.baked_tiles(h) and h not in self.disabled]
+        n = 0
+        for h in hs:
+            self.set_collision(h, False); n += h in self.disabled
+        self.zone_msg = 'disabled %d invisible walls in loaded collision (re-enable from the right-click menu)' % n
+
     def name_of(self, h):
-        if h in self.runtime: return self.runtime[h][1] + ' (spawned)'
+        if h in self.runtime: return self.runtime[h][1]
         return self.data.hash_name.get(h) or self.data.name_of(h)
 
     def live_actor(self, h, near=None):
@@ -896,25 +972,30 @@ class App(QWidget):
                 found = self.game.scan_u64(keys, 0x2140000000, 0x2160000000,
                                            (lambda f: setattr(self, 'zone_msg', 'zone: scanning %d%%' % (f * 100))) if first else None)
                 hit = set(found)
-                ratio = {s: len(hs & hit) / len(hs) for s, hs in self.data.scene_items.items() if hs}
-                act = {s for s, r in ratio.items() if r >= 0.9}
-                if not act and ratio and max(ratio.values()) >= 0.5:
-                    best = max(ratio, key=ratio.get)
-                    grp = re.sub(r'_(Static|Dynamic)$', '', best)
-                    act = {s for s in ratio if re.sub(r'_(Static|Dynamic)$', '', s) == grp}
                 live, named, runtime = {}, {}, {}
-                for a, (name, h) in self.game.actors().items():
+                acts = self.game.actors()
+                # Freed actors leave their placement records in the heap, so zones come from live actors only.
+                alive = {h for n, h in acts.values()}
+                ratio = {s: len(hs & alive) / len(hs) for s, hs in self.data.banc_sets().items() if len(hs & alive) >= 3}
+                act = set()
+                if ratio:
+                    best = max(ratio, key=ratio.get)
+                    for s, r in ratio.items():
+                        if r >= 0.3 or s == best: act |= {n for n in self.data.scene_names if re.sub(r'_(Static|Dynamic)$', '', n) == re.sub(r'_(Static|Dynamic)$', '', s)}
+                mp = np.array([p for _, p in self.game.models()] or [(1e9, 1e9, 1e9)], np.float32)
+                drawn = set(self.data.actors) | set(self.data.obj_pos)
+                for a, (name, h) in acts.items():
                     named.setdefault(name, []).append(a)
-                    if h and h != 0xFFFFFFFFFFFFFFFF: live.setdefault(h, a)
-                    elif name.split('_')[0] in ('Npc', 'Enemy', 'Animal', 'Obj', 'Item'):
+                    real = h and h != 0xFFFFFFFFFFFFFFFF
+                    if real: live.setdefault(h, a)
+                    if real and h in drawn or name.startswith(SKIP_ACTORS) or name in SYSTEM_ACTORS: continue
+                    p = self.game.actor_pos(a)
+                    if not p or sum(map(abs, p)) < 0.01: continue
+                    has_model = float(np.min(np.linalg.norm(mp - np.array(p, np.float32), axis=1))) < 1.0
+                    if has_model or name.split('_')[0] in ('Npc', 'Enemy', 'Animal', 'Obj', 'Item'):
                         runtime[RUNTIME | a] = (a, name)
                 self.runtime = runtime
                 self.live_named = named
-                for h, recs in found.items():
-                    if h in live: continue
-                    for r in recs:
-                        o = self.game.actor_of(r)
-                        if o: live[h] = o; break
                 self.detected = act
                 if self.manual is None: self.active = act or None
                 self.found_keys = np.array(sorted(hit), np.uint64)
@@ -956,6 +1037,7 @@ class App(QWidget):
                     is_obj = h in self.data.obj_info
                     if is_obj and not show_obj: continue
                     if not is_obj and not self.show_actors.isChecked(): continue
+                    if not self.show_navi.isChecked() and h in self.runtime and self.runtime[h][1].startswith('Npc_Navi'): continue
                     pos = self.game.actor_pos(obj)
                     if not pos or sum(map(abs, pos)) < 0.01 or abs(pos[0] - cx) > rng or abs(pos[2] - cz) > rng: continue
                     if is_obj:
