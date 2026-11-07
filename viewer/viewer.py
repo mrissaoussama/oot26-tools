@@ -122,6 +122,7 @@ class Data:
         self.lc = self.ls.mean(1)
         self.terrain, self.loading, self.tiles, self.bounds, self.names = {}, set(), {}, {}, {}
         self.conditional = np.zeros(0, np.uint64)
+        self.tile_info = {}
 
     def terrain_near(self, scenes, x, z, rng):
         out, pending = [], 0
@@ -168,6 +169,10 @@ class Data:
 
     def _load(self, path, key, tiles, scene):
         t, h, m, sub, f = havok.load_tile(path, key, tiles, self.names_for(scene))
+        raw = romfs.dec(open(path, 'rb').read())
+        owners = {}
+        for i, hh in havok.instance_actors(raw).items(): owners.setdefault(hh, []).append(i)
+        self.tile_info[path] = (raw[0x10:0x60], havok.instance_records(raw), owners)
         c = t.mean(1) if len(t) else np.zeros((0, 3), np.float32)
         self.bounds[path] = (c.min(0), c.max(0)) if len(t) else (np.full(3, 1e9), np.full(3, -1e9))
         self.terrain[path] = (t, c, h, m, sub, f)
@@ -306,8 +311,15 @@ class GLView(QOpenGLWidget):
             name = self.app.data.hash_name.get(h) or self.app.data.name_of(h) or 'object %x' % h
             menu.addAction('%s' % name).setEnabled(False)
             menu.addAction('Hide this in the viewer', lambda: self.app.hide(h))
+            if self.app.baked_tiles(h):
+                if h in self.app.disabled:
+                    menu.addAction('Re-enable collision in game', lambda: self.app.set_collision(h, True))
+                else:
+                    menu.addAction('Disable collision in game', lambda: self.app.set_collision(h, False))
         else:
             menu.addAction('Nothing pickable here').setEnabled(False)
+        if self.app.disabled:
+            menu.addAction('Re-enable everything I disabled (%d)' % len(self.app.disabled), self.app.restore_all)
         if len(self.app.hidden_keys):
             menu.addAction('Show everything hidden (%d)' % len(self.app.hidden_keys), self.app.unhide_all)
         menu.exec(e.globalPosition().toPoint())
@@ -535,6 +547,7 @@ class App(QWidget):
         self.obj_actors = {}
         self.manual, self.actor_version, self.detected = None, 0, set()
         self.hidden_version, self.obj_live_keys, self.dyn_picks, self.dyn = 0, None, [], []
+        self.disabled, self.loaded = {}, {}
         try:
             self.hidden_keys = np.array(json.load(open(os.path.join(HERE, 'hidden.json'))), np.uint64)
         except Exception:
@@ -598,6 +611,40 @@ class App(QWidget):
                 self.view.set_mode('free')
                 self.modes.button(3).setChecked(True)
                 self.view.free = [float(cx), float(cy) + 60, float(cz) + 60, 0.0, -0.75]
+
+    def baked_tiles(self, h):
+        return [p for p, (_, recs, owners) in self.data.tile_info.items() if h in owners]
+
+    def set_collision(self, h, enabled):
+        """Baked pieces live in the in-place loaded collision files; flip their instance state word."""
+        if enabled:
+            for addr, orig in self.disabled.pop(h, []): self.game.write_u32(addr, orig)
+            self.zone_msg = 'collision restored'
+            return
+        done = []
+        for path in self.baked_tiles(h):
+            pat, recs, owners = self.data.tile_info[path]
+            base = self.loaded.get(path)
+            if base is None or self.game.raw(self.game.addr['gb'] + base + 0x10, len(pat)) != pat:
+                base = self.game.find_bytes(pat)
+                base = base - 0x10 if base is not None else None
+                self.loaded[path] = base
+            if base is None: continue
+            for i in owners[h]:
+                if i not in recs: continue
+                addr = base + recs[i] + 28
+                word = self.game.read(self.game.addr['gb'] + addr, '<I')
+                if not word or (word[0] & 0xFF) & 0x20 == 0: continue
+                done.append((addr, word[0]))
+                self.game.write_u32(addr, ((word[0] & 0xFF) & ~0x48) | 0xFFFFFF00)
+        if done:
+            self.disabled[h] = done
+            self.zone_msg = 'collision disabled for %d piece(s) - move Link to wake physics' % len(done)
+        else:
+            self.zone_msg = 'could not find that piece in game memory'
+
+    def restore_all(self):
+        for h in list(self.disabled): self.set_collision(h, True)
 
     def hide(self, h):
         self.hidden_keys = np.union1d(self.hidden_keys, np.array([h], np.uint64)); self.save_hidden()

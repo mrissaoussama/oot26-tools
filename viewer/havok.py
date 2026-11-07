@@ -341,3 +341,20 @@ def terrain_mesh(b):
             tr, tg = _mesh_obj(t, 0); tris.append(tr); tags.append(tg)
     if not tris: return np.zeros((0, 3, 3), np.float32), np.zeros(0, np.int64)
     return np.concatenate(tris), np.concatenate(tags)
+
+
+def instance_records(b):
+    """Global instance index -> file offset of its 64-byte hknpShapeInstance record.
+    The u32 at +28 is the instance state: flags byte (0x40 = enabled) plus a 24-bit tree index."""
+    out, base = {}, 0
+    for o, sz in tag_sections(b):
+        try:
+            t = Tag(b, o, sz)
+        except Exception:
+            continue
+        if t.root != 'hknpCompoundShape': continue
+        inst = next(((off, k[1]) for off, k in t.items.items() if k[0] == 'hkFreeListArrayElement'), None)
+        if not inst: continue
+        for i in range(inst[1]): out[base + i] = t.D + inst[0] + i * 64
+        base += inst[1]
+    return out

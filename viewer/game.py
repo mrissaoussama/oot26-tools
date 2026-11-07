@@ -101,6 +101,22 @@ class Game:
             a = m.BaseAddress + m.RegionSize
         return out
 
+    def find_bytes(self, pat, lo=0x1000000000, hi=0x2000000000):
+        """Guest address of the first occurrence of pat in [lo, hi)."""
+        gb = self.addr.get('gb')
+        a, m = gb + lo, MBI()
+        while a < gb + hi and k32.VirtualQueryEx(self.h, a, ctypes.byref(m), ctypes.sizeof(m)):
+            if m.State == 0x1000 and m.Protect in (0x04, 0x40):
+                for off in range(0, m.RegionSize, 1 << 26):
+                    buf = self.raw(m.BaseAddress + off, min(1 << 26, m.RegionSize - off))
+                    j = buf.find(pat) if buf else -1
+                    if j >= 0: return m.BaseAddress + off + j - gb
+            a = m.BaseAddress + m.RegionSize
+        return None
+
+    def write_u32(self, guest, value):
+        ce('writeInteger(%d, %d) return 1' % (self.addr['gb'] + guest, value))
+
     def state(self):
         self.refresh()
         p = self.read(self.addr.get('linkpos'), '<3d')
