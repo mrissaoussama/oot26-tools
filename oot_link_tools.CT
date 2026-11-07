@@ -1,0 +1,382 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CheatTable CheatEngineTableVersion="45">
+<CheatEntries>
+<CheatEntry><ID>1</ID><Description>"Link tools (enable first; also opens cepipe for the viewer)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+-- Offsets are relative to the main module base (LT.M), which moves between emulator builds.
+LT = LT or {}
+LT.DATA_OFF = 0x484D000
+LT.CHECK_OFF, LT.CHECK_VAL_OFF = 0x4C7EFE0, 0x4DD71A0
+LT.VT_LINKOBJ_OFF, LT.VT_PARAM_OFF = 0x4B25E18, 0x4B63438
+LT.DISP_OFF = 0x4C7E740
+LT.LINKOBJ_PTRS = { {0x4E371D0,0x480}, {0x4E94858,0x2E0}, {0x4E935B8,0xEF8}, {0x4E94860,0x328}, {0x4E94368,0xD70} }
+MJ = MJ or { enabled=false, speed=12.0, key=VK_SPACE, downKey=VK_CONTROL, pad=nil, downPad=nil }
+SP = SP or { enabled=false, mult=2.0, key=nil }
+
+local function q(a) return a and readQword(a) end
+local function gq(g) return LT.gb and g and readQword(LT.gb + g) end
+
+local function linkObjAt(c, M)
+  for _,p in ipairs(LT.LINKOBJ_PTRS) do
+    local st = readQword(c + M + p[1])
+    local o = st and readQword(c + st + p[2])
+    if o and readQword(c + o) == M + LT.VT_LINKOBJ_OFF then return o end
+  end
+end
+
+local function validBase(c, M)
+  if not (c and M) or c &lt;= 0 then return false end
+  if readQword(c + M + LT.CHECK_OFF) ~= M + LT.CHECK_VAL_OFF then return false end
+  if linkObjAt(c, M) then return true end
+  local G = readQword(c + M + LT.DISP_OFF)
+  local Q = G and readQword(c + G)
+  return Q ~= nil and readFloat(c + Q + 0x29C) ~= nil
+end
+
+function ltFindGuestBase()
+  if validBase(LT.gb, LT.M) then return LT.gb, LT.M end
+  for _,r in ipairs(enumMemoryRegions()) do
+    local H = r.BaseAddress
+    local v = readQword(H + (LT.CHECK_OFF - LT.DATA_OFF))
+    if v and v &gt; LT.CHECK_VAL_OFF then
+      local M = v - LT.CHECK_VAL_OFF
+      if M % 0x1000 == 0 then
+        local c = H - (M + LT.DATA_OFF)
+        if validBase(c, M) then
+          registerSymbol("guestbase", c, true)
+          registerSymbol("gamemain", c + M, true)
+          return c, M
+        end
+      end
+    end
+  end
+  return nil
+end
+
+function ltLinkObj()
+  return LT.gb and linkObjAt(LT.gb, LT.M)
+end
+
+function ltDisplayPos()
+  local Q = gq(gq(LT.M + LT.DISP_OFF))
+  if not Q then return nil end
+  local a = LT.gb + Q + 0x29C
+  return readFloat(a), readFloat(a+4), readFloat(a+8)
+end
+
+local function setSym(name, addr)
+  if addr ~= LT[name] then
+    if addr then registerSymbol(name, addr, true) else pcall(unregisterSymbol, name) end
+    LT[name] = addr
+  end
+end
+
+function ltUpdateHealth()
+  local o = ltLinkObj()
+  setSym("linkobj", o and LT.gb + o)
+  local o2 = o and gq((gq(o + 8) or 0) + 0x6A0)
+  local p, m = o2 and gq(o2 + 0x1C10), o2 and gq(o2 + 0x1C18)
+  if p and gq(p) == LT.M + LT.VT_PARAM_OFF then setSym("linkhp", LT.gb + p + 8) else setSym("linkhp", nil) end
+  local cam = p and LT.gb + p + 0x978
+  if cam and o then
+    local cx, cy, cz = readFloat(cam), readFloat(cam + 4), readFloat(cam + 8)
+    local lx, ly, lz = readFloat(LT.gb + o + 0x31C), readFloat(LT.gb + o + 0x320), readFloat(LT.gb + o + 0x324)
+    if not (cx and lx and math.abs(cx - lx) + math.abs(cy - ly) + math.abs(cz - lz) &lt; 60) then cam = nil end
+  end
+  setSym("linkcam", cam)
+  if m and gq(m) == LT.M + LT.VT_PARAM_OFF then setSym("linkhpmax", LT.gb + m + 8) end
+end
+
+function ltFindPos()
+  local x, y, z = ltDisplayPos()
+  if not x then return nil end
+  -- Coordinates near 0 match too many doubles, so scan the largest one.
+  local axes = { {x, 0}, {y + 0.585, 8}, {z, 0x10} }
+  table.sort(axes, function(p, q) return math.abs(p[1]) &gt; math.abs(q[1]) end)
+  local v, off = axes[1][1], axes[1][2]
+  local function scan(lo, hi, w)
+    local ms = createMemScan()
+    ms.firstScan(soValueBetween, vtDouble, rtRounded, string.format("%.6f", v-w), string.format("%.6f", v+w), lo, hi, "+W", fsmAligned, "8", false, false, false, false)
+    ms.waitTillDone()
+    local fl = createFoundList(ms) fl.initialize()
+    local c
+    if fl.Count &lt;= 20000 then
+      c = {}
+      for i=0, fl.Count-1 do
+        local a = tonumber(fl.getAddress(i), 16) - off
+        local px, py, pz = readDouble(a), readDouble(a+8), readDouble(a+0x10)
+        if px and py and pz and math.abs(px - x) &lt; 3 and math.abs(pz - z) &lt; 3 and math.abs(py - y - 0.585) &lt; 3 then table.insert(c, {a=a, s=0}) end
+      end
+    end
+    fl.destroy() ms.destroy()
+    return c
+  end
+  local function scanRange(lo, hi)
+    for _,w in ipairs({3, 0.75, 0.2}) do
+      local c = scan(lo, hi, w)
+      if c then return c end
+    end
+    return {}
+  end
+  local c = scanRange(LT.gb + 0x2100000000, LT.gb + 0x2300000000)
+  if #c == 0 then c = scanRange(LT.gb + 0x2000000000, LT.gb + 0x4000000000) end
+  if #c == 0 then return nil end
+  for n=1,6 do
+    local dx, dy, dz = ltDisplayPos()
+    if not (dx and dy and dz) then return nil end
+    for _,e in ipairs(c) do
+      local px, py, pz = readDouble(e.a), readDouble(e.a+8), readDouble(e.a+0x10)
+      if px and py and pz then e.s = e.s + math.abs(px-dx) + math.abs(pz-dz) + math.abs(py-dy-0.585) else e.s = e.s + 1e9 end
+    end
+    sleep(20)
+  end
+  table.sort(c, function(p, q) return p.s &lt; q.s end)
+  local good = {}
+  for _,e in ipairs(c) do if e.s / 6 &lt; 0.3 then table.insert(good, e.a) end end
+  if LT.debug then for _,e in ipairs(c) do if e.s/6 &lt; 0.3 then LT.debug(string.format("cand %X score=%.4f", e.a - LT.gb, e.s/6)) end end end
+  if #good == 0 then return nil end
+  -- Only the record that drives Link moves the displayed position when nudged.
+  local NUDGE, best = 0.3, nil
+  for i=1, math.min(#good, 10) do
+    local a = good[i]
+    local p0 = ltDisplayPos() sleep(150) local p1 = ltDisplayPos()
+    local nudged = readDouble(a) + NUDGE
+    writeDouble(a, nudged)
+    sleep(150)
+    local p2 = ltDisplayPos()
+    if not (p0 and p1 and p2) then return nil end
+    local gain = (p2 - p1) - (p1 - p0)
+    if LT.debug then LT.debug(string.format("test %X gain=%.3f", a - LT.gb, gain)) end
+    if gain &gt; NUDGE * 0.5 then
+      writeDouble(a, readDouble(a) - NUDGE)
+      best = a break
+    end
+    local v = readDouble(a)
+    if v and math.abs(v - nudged) &lt; 0.05 then writeDouble(a, v - NUDGE) end
+    sleep(30)
+  end
+  if not best then return nil end
+  LINKPOS_ALL = { best }
+  for _,a in ipairs(good) do if a ~= best then table.insert(LINKPOS_ALL, a) end end
+  setSym("linkpos", best)
+  return best
+end
+
+function linkTeleport(nx, ny, nz)
+  local b = LT.linkpos
+  if not b then return end
+  local dx, dy, dz = nx - readDouble(b), ny + 0.585 - readDouble(b+8), nz - readDouble(b+0x10)
+  for _,a in ipairs(LINKPOS_ALL or { b }) do
+    writeDouble(a, readDouble(a) + dx) writeDouble(a+8, readDouble(a+8) + dy) writeDouble(a+0x10, readDouble(a+0x10) + dz)
+  end
+end
+
+local function posOk()
+  local x, y, z = ltDisplayPos()
+  if not x then return false end
+  if not LT.linkpos or not LINKPOS_ALL then return false end
+  for _,a in ipairs(LINKPOS_ALL) do
+    local px, pz = readDouble(a), readDouble(a+0x10)
+    if not (px and pz) or math.abs(px - x) &gt; 3 or math.abs(pz - z) &gt; 3 then return false end
+  end
+  return true
+end
+
+-- memscan and sleep on CE's GUI thread freeze CE.
+function ltSlowTick()
+  local now = getTickCount()
+  if LT.busy and now - (LT.busySince or 0) &lt; 30000 then return end
+  LT.busy, LT.busySince = true, now
+  createThread(function()
+    local ok, e = pcall(ltSlowTickInner)
+    LT.finding = false
+    LT.busy = false
+    if not ok then LT.lastErr = tostring(e) end
+  end)
+end
+
+function ltSlowTickInner()
+  if not validBase(LT.gb, LT.M) then LT.gb, LT.M = ltFindGuestBase() if not LT.gb then return end end
+  ltUpdateHealth()
+  local now = getTickCount()
+  local x, y, z = ltDisplayPos()
+  -- A big jump means a zone change: re-find once loading settles.
+  if x and LT.lastX and (math.abs(x - LT.lastX) + math.abs(z - LT.lastZ) &gt; 15) then
+    LT.zoneChangedAt = now
+  end
+  if x then LT.lastX, LT.lastZ = x, z end
+  local need = not posOk()
+  if LT.zoneChangedAt and now - LT.zoneChangedAt &gt; 1500 then need, LT.zoneChangedAt, LT.forceFind = true, nil, true end
+  if need then
+    LT.bad = (LT.bad or 0) + 1
+    if (LT.bad &gt;= 2 or LT.forceFind) and now - (LT.lastFind or 0) &gt; 2000 then
+      LT.lastFind = now
+      MJ.active = false
+      LT.finding = true
+      local p = ltFindPos()
+      LT.finding = false
+      if p then LT.bad, LT.forceFind = 0, false
+      else LT.forceFind = true LINKPOS_ALL = nil setSym("linkpos", nil) end
+    end
+  else LT.bad = 0 end
+end
+
+local function padHeld(name)
+  if not name then return false end
+  local ok, st = pcall(getXBox360ControllerState, 0)
+  return ok and st and st[name] == true
+end
+
+function ltMoonTick()
+  if LT.finding or not MJ.enabled or not LT.linkpos then MJ.active = false return end
+  local up = isKeyPressed(MJ.key) or padHeld(MJ.pad)
+  local down = (MJ.downKey and isKeyPressed(MJ.downKey)) or padHeld(MJ.downPad)
+  local now = getTickCount()
+  if up or down then
+    if not MJ.active then
+      MJ.active, MJ.t, MJ.lift, MJ.base = true, now, 0, {}
+      for _,a in ipairs(LINKPOS_ALL or { LT.linkpos }) do MJ.base[a] = readDouble(a + 8) end
+    end
+    local dt = math.min(now - MJ.t, 100) / 1000
+    MJ.lift = MJ.lift + (up and MJ.speed or -MJ.speed) * dt
+    MJ.t = now
+    for a, y0 in pairs(MJ.base) do writeDouble(a + 8, y0 + MJ.lift) end
+  else
+    MJ.active = false
+  end
+end
+
+function ltSpeedTick()
+  local b = LT.linkpos
+  if LT.finding or not SP.enabled or not b or (SP.key and not isKeyPressed(SP.key)) then SP.last = nil return end
+  local x, z = readDouble(b), readDouble(b + 0x10)
+  if not (x and z) then SP.last = nil return end
+  local l = SP.last
+  if l and l.b == b then
+    local dx, dz = x - l.x, z - l.z
+    local d = math.abs(dx) + math.abs(dz)
+    if d &gt; 0.0005 and d &lt; 2 then
+      local k = SP.mult - 1
+      for _,a in ipairs(LINKPOS_ALL or { b }) do
+        writeDouble(a, readDouble(a) + dx * k) writeDouble(a + 0x10, readDouble(a + 0x10) + dz * k)
+      end
+      x, z = x + dx * k, z + dz * k
+    end
+  end
+  SP.last = { b=b, x=x, z=z }
+end
+
+-- linkcalc: +0 speed xz, +4 speed 3D, +8 accel xz, +C heading, +10 vertical speed, +14 camera yaw, +18 camera pitch, +1C camera distance
+function ltCalcTick()
+  local o, c = LT.linkobj, LT.linkcalc
+  if not (o and c) then return end
+  local vx, vy, vz = readFloat(o + 0x388), readFloat(o + 0x38C), readFloat(o + 0x390)
+  if not (vx and vy and vz) then return end
+  local h = math.sqrt(vx*vx + vz*vz)
+  writeFloat(c, h) writeFloat(c + 4, math.sqrt(vx*vx + vy*vy + vz*vz)) writeFloat(c + 0x10, vy)
+  local fx, fz = readFloat(o + 0x330), readFloat(o + 0x328)
+  if fx and fz then writeFloat(c + 0xC, math.deg(math.atan(fx, fz))) end
+  local cam = LT.linkcam
+  if cam then
+    local dx, dy, dz = readFloat(cam) - readFloat(o + 0x31C), readFloat(cam + 4) - readFloat(o + 0x320), readFloat(cam + 8) - readFloat(o + 0x324)
+    local hd = math.sqrt(dx*dx + dz*dz)
+    writeFloat(c + 0x14, math.deg(math.atan(-dx, -dz)))
+    writeFloat(c + 0x18, math.deg(math.atan(-dy, hd)))
+    writeFloat(c + 0x1C, math.sqrt(hd*hd + dy*dy))
+  end
+  local now = getTickCount()
+  if not LT.accT then LT.accT, LT.accV = now, h end
+  if now - LT.accT &gt;= 100 then
+    writeFloat(c + 8, (h - LT.accV) * 1000 / (now - LT.accT))
+    LT.accT, LT.accV = now, h
+  end
+end
+
+function ltFastTick()
+  pcall(ltMoonTick)
+  pcall(ltSpeedTick)
+  pcall(ltCalcTick)
+end
+
+function ltStart()
+  ltStop()
+  if not LT.pipe then LT.pipe = pcall(openLuaServer, "cepipe") end
+  LT.gb, LT.M = ltFindGuestBase()
+  if not LT.gb then error("guestbase not found (is the game running?)") end
+  LT.linkpos, LT.busy, LT.finding, LT.lastFind, LT.forceFind = nil, false, false, 0, true
+  ltUpdateHealth()
+  if not LT.linkcalc then LT.linkcalc = allocateMemory(0x100) registerSymbol("linkcalc", LT.linkcalc, true) end
+  LT.slow = createTimer(nil, false) LT.slow.Interval = 500
+  LT.slow.OnTimer = function()
+    local ok, e = pcall(ltSlowTick)
+    if not ok then print("LinkTools: " .. tostring(e)) end
+    if LT.lastErr then print("LinkTools: " .. LT.lastErr) LT.lastErr = nil end
+  end
+  LT.slow.Enabled = true
+  LT.fast = createTimer(nil, false) LT.fast.Interval = 15
+  LT.fast.OnTimer = function() ltFastTick() end
+  LT.fast.Enabled = true
+  print(string.format("LinkTools: guestbase=%X main=%X hp=%X (position search running in background)", LT.gb, LT.M, LT.linkhp or 0))
+end
+
+function ltStop()
+  if LT.slow then LT.slow.destroy() LT.slow = nil end
+  if LT.fast then LT.fast.destroy() LT.fast = nil end
+end
+
+ltStart()
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+if ltStop then ltStop() end
+{$asm}
+</AssemblerScript></CheatEntry>
+<CheatEntry><ID>2</ID><Description>"Moonjump (hold Space = up, Ctrl = down; edit script for keys/pad/speed)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not (LT and LT.fast) then error("Enable 'Link tools' first") end
+-- speed = units per second
+-- keys: VK_ codes, e.g. VK_SPACE, VK_SHIFT, VK_CONTROL, VK_E, VK_XBUTTON1
+-- pad: XInput button name or nil, e.g. 'GAMEPAD_A', 'GAMEPAD_B', 'GAMEPAD_X', 'GAMEPAD_Y',
+--      'GAMEPAD_LEFT_SHOULDER', 'GAMEPAD_RIGHT_SHOULDER', 'GAMEPAD_LEFT_THUMB'
+MJ = MJ or {}
+MJ.speed = 12.0
+MJ.key = VK_SPACE
+MJ.downKey = VK_CONTROL
+MJ.pad = nil
+MJ.downPad = nil
+MJ.enabled = true
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+if MJ then MJ.enabled = false end
+{$asm}
+</AssemblerScript></CheatEntry>
+<CheatEntry><ID>3</ID><Description>"Speed multiplier (x2; edit script for value / hold key)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not (LT and LT.fast) then error("Enable 'Link tools' first") end
+-- mult: 2.0 = double speed, 0.5 = half. key: nil = always on, or e.g. VK_SHIFT = only while held
+SP = SP or {}
+SP.mult = 2.0
+SP.key = nil
+SP.enabled = true
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+if SP then SP.enabled = false end
+{$asm}
+</AssemblerScript></CheatEntry>
+<CheatEntry><ID>6</ID><Description>"Link health"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>4</ID><Description>"Health (1 = quarter heart)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>4 Bytes</VariableType><Address>linkhp</Address></CheatEntry><CheatEntry><ID>5</ID><Description>"Max health (4 per heart)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>4 Bytes</VariableType><Address>linkhpmax</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>10</ID><Description>"Link position (double, writable = teleport)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>7</ID><Description>"X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos</Address></CheatEntry><CheatEntry><ID>8</ID><Description>"Y (physics = world Y + 0.585)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos+8</Address></CheatEntry><CheatEntry><ID>9</ID><Description>"Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos+10</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>22</ID><Description>"Link motion (read-only: game rewrites these every frame)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>11</ID><Description>"Velocity X (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+388</Address></CheatEntry><CheatEntry><ID>12</ID><Description>"Velocity Y (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+38C</Address></CheatEntry><CheatEntry><ID>13</ID><Description>"Velocity Z (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+390</Address></CheatEntry><CheatEntry><ID>14</ID><Description>"Turn rate (rad/s, + = left)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+398</Address></CheatEntry><CheatEntry><ID>15</ID><Description>"Facing X (sin)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+330</Address></CheatEntry><CheatEntry><ID>16</ID><Description>"Facing Z (cos)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+328</Address></CheatEntry><CheatEntry><ID>17</ID><Description>"Speed horizontal (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc</Address></CheatEntry><CheatEntry><ID>18</ID><Description>"Speed 3D (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+4</Address></CheatEntry><CheatEntry><ID>19</ID><Description>"Accel horizontal (calc, units/s^2)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+8</Address></CheatEntry><CheatEntry><ID>20</ID><Description>"Heading deg (calc, 0 = +Z)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+C</Address></CheatEntry><CheatEntry><ID>21</ID><Description>"Vertical speed (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+10</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>29</ID><Description>"Camera (from player data, read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>23</ID><Description>"Camera X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam</Address></CheatEntry><CheatEntry><ID>24</ID><Description>"Camera Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam+4</Address></CheatEntry><CheatEntry><ID>25</ID><Description>"Camera Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam+8</Address></CheatEntry><CheatEntry><ID>26</ID><Description>"Camera yaw deg (calc, direction it looks, 0 = +Z)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+14</Address></CheatEntry><CheatEntry><ID>27</ID><Description>"Camera pitch deg (calc, - = looking down)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+18</Address></CheatEntry><CheatEntry><ID>28</ID><Description>"Camera distance from Link (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+1C</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>37</ID><Description>"Game camera (read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>30</ID><Description>"Position X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+38</Address></CheatEntry><CheatEntry><ID>31</ID><Description>"Position Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+3C</Address></CheatEntry><CheatEntry><ID>32</ID><Description>"Position Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+40</Address></CheatEntry><CheatEntry><ID>33</ID><Description>"Look-at X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+44</Address></CheatEntry><CheatEntry><ID>34</ID><Description>"Look-at Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+48</Address></CheatEntry><CheatEntry><ID>35</ID><Description>"Look-at Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+4C</Address></CheatEntry><CheatEntry><ID>36</ID><Description>"FOV (radians)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+130</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>41</ID><Description>"Link position (display, read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>38</ID><Description>"X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+29C</Address></CheatEntry><CheatEntry><ID>39</ID><Description>"Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+2A0</Address></CheatEntry><CheatEntry><ID>40</ID><Description>"Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+2A4</Address></CheatEntry></CheatEntries></CheatEntry>
+</CheatEntries>
+<UserdefinedSymbols/>
+</CheatTable>
