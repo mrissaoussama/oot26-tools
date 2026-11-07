@@ -60,7 +60,7 @@ class Data:
         self.wc = self.wt.mean(1)
         self.ls, self.lk, self.lss = np.concatenate(segs), np.array(sk), np.array(ss)
         self.lc = self.ls.mean(1)
-        self.terrain, self.loading, self.tiles = {}, set(), {}
+        self.terrain, self.loading, self.tiles, self.bounds = {}, set(), {}, {}
 
     def terrain_near(self, scenes, x, z, rng):
         out, pending = [], 0
@@ -69,19 +69,26 @@ class Data:
             if sc not in self.tiles: self.tiles[sc] = havok.tiles_for(sc)
             tiles = self.tiles[sc]
             for key, path in tiles.items():
-                o = havok.tile_origin(tiles, key)
-                if x + rng < o[0] or x - rng > o[0] + havok.TILE or z + rng < o[2] or z - rng > o[2] + havok.TILE: continue
+                if path not in self.bounds and len(tiles) > 1:
+                    o = np.array([(key[0] - max(k[0] for k in tiles) / 2 - 1.5) * havok.TILE, 0, (key[1] - max(k[1] for k in tiles) / 2 - 1.5) * havok.TILE])
+                    lo, hi = o, o + 3 * havok.TILE
+                    if x + rng < lo[0] or x - rng > hi[0] or z + rng < lo[2] or z - rng > hi[2]: continue
+                if path in self.bounds:
+                    lo, hi = self.bounds[path]
+                    if x + rng < lo[0] or x - rng > hi[0] or z + rng < lo[2] or z - rng > hi[2]: continue
                 if path in self.terrain: out.append(self.terrain[path])
                 else:
                     pending += 1
                     if path not in self.loading:
                         self.loading.add(path)
-                        threading.Thread(target=self._load, args=(path, o), daemon=True).start()
+                        threading.Thread(target=self._load, args=(path, key, tiles), daemon=True).start()
         return out, pending
 
-    def _load(self, path, origin):
-        t = havok.load_tile(path, origin)
-        self.terrain[path] = (t, t.mean(1) if len(t) else np.zeros((0, 3), np.float32))
+    def _load(self, path, key, tiles):
+        t = havok.load_tile(path, key, tiles)
+        c = t.mean(1) if len(t) else np.zeros((0, 3), np.float32)
+        self.bounds[path] = (c.min(0), c.max(0)) if len(t) else (np.full(3, 1e9), np.full(3, -1e9))
+        self.terrain[path] = (t, c)
 
 
 def vertices(tris, rgb, a):
@@ -166,7 +173,8 @@ class GLView(QOpenGLWidget):
         lx, ly, lz = s['x'], s['y'], s['z']
         show = {k: cb.isChecked() for k, cb in app.showk.items()}
         height = app.only_height.isChecked()
-        key = (round(lx / (rng / 4)), round(lz / (rng / 4)), round(ly / 6) if height else 0, rng, tuple(sorted(show.items())),
+        ceil = app.no_ceiling.isChecked() and self.mode != 'game'
+        key = (round(lx / (rng / 4)), round(lz / (rng / 4)), round(ly / 2) if height or ceil else 0, ceil, rng, tuple(sorted(show.items())),
                app.only_zone.isChecked(), height, tuple(sorted(app.active or ())), len(d.terrain))
         if key == self.build_key: return
         self.build_key = key
@@ -188,6 +196,7 @@ class GLView(QOpenGLWidget):
             tl, pending = d.terrain_near(sorted(app.active), lx, lz, rng)
             for t, c in tl:
                 m = (np.abs(c[:, 0] - lx) < rng) & (np.abs(c[:, 2] - lz) < rng) if len(t) else None
+                if m is not None and ceil: m &= t[:, :, 1].min(1) < ly + 3.5
                 if m is not None and m.any(): opaque.append(vertices(t[m], *KCOL['terrain']))
         cat = lambda L: np.concatenate(L) if L else np.zeros((0, 10), np.float32)
         self.upload('opaque', cat(opaque)); self.upload('trans', cat(trans)); self.upload('lines', cat(lines))
@@ -269,6 +278,7 @@ class App(QWidget):
         sl.addWidget(QLabel('<b>Filters</b>'))
         self.only_zone = QCheckBox('Only the loaded zone'); self.only_zone.setChecked(True); sl.addWidget(self.only_zone)
         self.only_height = QCheckBox("Walls near Link's height only"); sl.addWidget(self.only_height)
+        self.no_ceiling = QCheckBox('Hide ceilings (for dungeons)'); self.no_ceiling.setChecked(True); sl.addWidget(self.no_ceiling)
         b = QPushButton('Re-detect zone'); b.clicked.connect(self.detect); sl.addWidget(b)
         b = QPushButton('Set romfs folder (for terrain)'); b.clicked.connect(self.pick_romfs); sl.addWidget(b)
         self.range = QSlider(Qt.Horizontal); self.range.setRange(15, 250); self.range.setValue(60)
