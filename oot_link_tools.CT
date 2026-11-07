@@ -399,70 +399,6 @@ function ltStop()
   if LT.fast then LT.fast.destroy() LT.fast = nil end
 end
 
-ltStart()
-{$asm}
-[DISABLE]
-{$lua}
-if syntaxcheck then return end
-if ltStop then ltStop() end
-{$asm}
-</AssemblerScript></CheatEntry>
-<CheatEntry><ID>2</ID><Description>"Moonjump (hold Space = up, Ctrl = down; edit script for keys/pad/speed)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
-{$lua}
-if syntaxcheck then return end
-if not (LT and LT.fast) then error("Enable 'Link tools' first") end
--- speed = units per second
--- keys: VK_ codes, e.g. VK_SPACE, VK_SHIFT, VK_CONTROL, VK_E, VK_XBUTTON1
--- pad: XInput button name or nil, e.g. 'GAMEPAD_A', 'GAMEPAD_B', 'GAMEPAD_X', 'GAMEPAD_Y',
---      'GAMEPAD_LEFT_SHOULDER', 'GAMEPAD_RIGHT_SHOULDER', 'GAMEPAD_LEFT_THUMB'
-MJ = MJ or {}
-MJ.speed = 12.0
-MJ.key = VK_SPACE
-MJ.downKey = VK_CONTROL
-MJ.pad = nil
-MJ.downPad = nil
-MJ.enabled = true
-{$asm}
-[DISABLE]
-{$lua}
-if syntaxcheck then return end
-if MJ then MJ.enabled = false end
-{$asm}
-</AssemblerScript></CheatEntry>
-<CheatEntry><ID>3</ID><Description>"Speed multiplier (x2; edit script for value / hold key)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
-{$lua}
-if syntaxcheck then return end
-if not (LT and LT.fast) then error("Enable 'Link tools' first") end
--- mult: 2.0 = double speed, 0.5 = half. key: nil = always on, or e.g. VK_SHIFT = only while held
-SP = SP or {}
-SP.mult = 2.0
-SP.key = nil
-SP.enabled = true
-{$asm}
-[DISABLE]
-{$lua}
-if syntaxcheck then return end
-if SP then SP.enabled = false end
-{$asm}
-</AssemblerScript></CheatEntry>
-<CheatEntry><ID>4</ID><Description>"Free camera (numpad 8456 move, 9/3 up/down, right mouse = look)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
-{$lua}
-if syntaxcheck then return end
-if not (LT and LT.gb) then error("Enable 'Link tools' first") end
--- numpad 8/5 forward/back, 4/6 left/right, 9/3 up/down, numpad + faster, hold right mouse button to look
-FC.speed = 12.0
-fcStart()
-{$asm}
-[DISABLE]
-{$lua}
-if syntaxcheck then return end
-if fcStop then fcStop() end
-{$asm}
-</AssemblerScript></CheatEntry>
-<CheatEntry><ID>5</ID><Description>"Travel to another map (opens a window: pick map + spawn point)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
-{$lua}
-if syntaxcheck then return end
-if not (LT and LT.gb) then error("Enable 'Link tools' first") end
 TRAVEL_SPAWNS = {
   ["BarinadeStage"] = {{"BarinadeStage", "Dm_SY_BancChangeArrive", "other spawn point"}, {"StartPos_SubEvent_AllBossBattle", "Dm_SY_BancChangeArrive", "other spawn point"}},
   ["BigOctoStage"] = {{"BigOctoStage", "Dm_SY_BancChangeArrive", "other spawn point"}, {"StartPos_SubEvent_AllBossBattle", "Dm_SY_BancChangeArrive", "other spawn point"}},
@@ -596,12 +532,43 @@ TRAVEL_EXITS = {
   ["ZoraRiver_Child"] = {{-101.15, 95.96, 26.47}, {-99.65, 94.91, 37.45}, {145.85, 132.65, -40.83}, {122.57, 118.14, -9.09}},
 }
 
--- GameData String64 values of the reserved map change (guest addresses, same every boot of this game version).
--- The hash at TRAVEL_CHECK (murmur3 of Sequence_ReservedNextBanc) confirms the layout before anything is written.
-TRAVEL_SLOT = {cur = 0x2185BA5BFC, event = 0x2185BA5D04, starter = 0x2185BA5E0C, banc = 0x2185BA5F14, pos = 0x2185BA601C}
-TRAVEL_CHECK = 0x2185BA3A38
+-- GameData String64 values. Each entry is three FixedSafeString&lt;64&gt; (0x108 bytes); the live value is the second.
+-- The block moves between boots, so it is found through the hash-table entry of Sequence_CurrentBanc
+-- (murmur3 0x1D6189DA, index 0x1F); its values start 0x207C after that entry.
+GD_IDX = {cur = 0x1F, event = 0x20, starter = 0x21, banc = 0x22, pos = 0x23,
+          shield2 = 0x0E, weapon2 = 0x0F, armor = 0x10, arrow = 0x11, boot = 0x12, ocarina = 0x15, shield = 0x16, weapon = 0x17}
 
-local function tvOk() return LT and LT.gb and (readInteger(LT.gb + TRAVEL_CHECK) or 0) &amp; 0xFFFFFFFF == 0xEE27BF71 end
+function gdFind()
+  if GD_BASE and (readString(GD_BASE + 0x1F * 0x108, 64) or '') ~= '' then return GD_BASE end
+  local ms = createMemScan()
+  ms.firstScan(soExactValue, vtByteArray, nil, 'DA 89 61 1D 1F 00 00 00', nil,
+               LT.gb + 0x2180000000, LT.gb + 0x2190000000, '', fsmAligned, '8', true, false, false, false)
+  ms.waitTillDone()
+  local fl = createFoundList(ms) fl.initialize()
+  for i = 0, fl.Count - 1 do
+    local cur = tonumber(fl.getAddress(i), 16) + 0x207C
+    local name = readString(cur, 64) or ''
+    if name:match('^[%w_]+$') and #name &gt; 3 then GD_BASE = cur - 0x1F * 0x108 break end
+  end
+  fl.destroy() ms.destroy()
+  if GD_BASE then registerSymbol('gdstr', GD_BASE, true) end
+  return GD_BASE
+end
+
+TRAVEL_SLOT = setmetatable({}, {__index = function(_, k) return GD_IDX[k] and (GD_BASE - LT.gb) + GD_IDX[k] * 0x108 end})
+
+-- memscan freezes CE on its GUI thread, so searches run in a worker thread.
+function gdFindAsync()
+  if GD_BUSY then return end
+  GD_BUSY = true
+  createThread(function() pcall(gdFind) GD_BUSY = false end)
+end
+
+local function tvOk()
+  if GD_BASE and (readString(GD_BASE + 0x1F * 0x108, 64) or '') ~= '' then return true end
+  GD_BASE = nil gdFindAsync()
+  return false
+end
 local function tvGet(k) return readString(LT.gb + TRAVEL_SLOT[k], 64) or '' end
 local function tvPut(k, s)
   local b = {} for i = 1, 64 do b[i] = 0 end
@@ -611,7 +578,7 @@ end
 
 -- Waits for any exit to reserve a map change, then swaps in the chosen map and spawn point.
 function travelArm(banc, pos, event)
-  if not tvOk() then showMessage('Travel: game data not found (different game version?)') return end
+  if not tvOk() then showMessage('Travel: still locating the game data, try again in a few seconds') return end
   if TRAVEL_TIMER then TRAVEL_TIMER.destroy() TRAVEL_TIMER = nil end
   tvPut('banc', '')
   local t0 = getTickCount()
@@ -637,6 +604,7 @@ function travelArm(banc, pos, event)
 end
 
 function travelForm()
+  gdFindAsync()
   if TRAVEL_FORM then TRAVEL_FORM.show() return end
   local f = createForm(false)
   f.Caption = 'Travel' f.Width = 520 f.Height = 460 f.Position = 'poScreenCenter'
@@ -660,6 +628,72 @@ function travelForm()
   f.show()
 end
 
+ltStart()
+gdFindAsync()
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+if ltStop then ltStop() end
+{$asm}
+</AssemblerScript></CheatEntry>
+<CheatEntry><ID>2</ID><Description>"Moonjump (hold Space = up, Ctrl = down; edit script for keys/pad/speed)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not (LT and LT.fast) then error("Enable 'Link tools' first") end
+-- speed = units per second
+-- keys: VK_ codes, e.g. VK_SPACE, VK_SHIFT, VK_CONTROL, VK_E, VK_XBUTTON1
+-- pad: XInput button name or nil, e.g. 'GAMEPAD_A', 'GAMEPAD_B', 'GAMEPAD_X', 'GAMEPAD_Y',
+--      'GAMEPAD_LEFT_SHOULDER', 'GAMEPAD_RIGHT_SHOULDER', 'GAMEPAD_LEFT_THUMB'
+MJ = MJ or {}
+MJ.speed = 12.0
+MJ.key = VK_SPACE
+MJ.downKey = VK_CONTROL
+MJ.pad = nil
+MJ.downPad = nil
+MJ.enabled = true
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+if MJ then MJ.enabled = false end
+{$asm}
+</AssemblerScript></CheatEntry>
+<CheatEntry><ID>3</ID><Description>"Speed multiplier (x2; edit script for value / hold key)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not (LT and LT.fast) then error("Enable 'Link tools' first") end
+-- mult: 2.0 = double speed, 0.5 = half. key: nil = always on, or e.g. VK_SHIFT = only while held
+SP = SP or {}
+SP.mult = 2.0
+SP.key = nil
+SP.enabled = true
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+if SP then SP.enabled = false end
+{$asm}
+</AssemblerScript></CheatEntry>
+<CheatEntry><ID>4</ID><Description>"Free camera (numpad 8456 move, 9/3 up/down, right mouse = look)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not (LT and LT.gb) then error("Enable 'Link tools' first") end
+-- numpad 8/5 forward/back, 4/6 left/right, 9/3 up/down, numpad + faster, hold right mouse button to look
+FC.speed = 12.0
+fcStart()
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+if fcStop then fcStop() end
+{$asm}
+</AssemblerScript></CheatEntry>
+<CheatEntry><ID>14</ID><Description>"Equipment (current, editable text; found by Link tools)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>5</ID><Description>"Sword"</Description><VariableType>String</VariableType><Length>64</Length><Unicode>0</Unicode><CodePage>0</CodePage><ZeroTerminate>1</ZeroTerminate><Address>gdstr+17B8</Address></CheatEntry><CheatEntry><ID>6</ID><Description>"Shield"</Description><VariableType>String</VariableType><Length>64</Length><Unicode>0</Unicode><CodePage>0</CodePage><ZeroTerminate>1</ZeroTerminate><Address>gdstr+16B0</Address></CheatEntry><CheatEntry><ID>7</ID><Description>"Tunic / armor"</Description><VariableType>String</VariableType><Length>64</Length><Unicode>0</Unicode><CodePage>0</CodePage><ZeroTerminate>1</ZeroTerminate><Address>gdstr+1080</Address></CheatEntry><CheatEntry><ID>8</ID><Description>"Boots"</Description><VariableType>String</VariableType><Length>64</Length><Unicode>0</Unicode><CodePage>0</CodePage><ZeroTerminate>1</ZeroTerminate><Address>gdstr+1290</Address></CheatEntry><CheatEntry><ID>9</ID><Description>"Arrow type"</Description><VariableType>String</VariableType><Length>64</Length><Unicode>0</Unicode><CodePage>0</CodePage><ZeroTerminate>1</ZeroTerminate><Address>gdstr+1188</Address></CheatEntry><CheatEntry><ID>10</ID><Description>"Ocarina"</Description><VariableType>String</VariableType><Length>64</Length><Unicode>0</Unicode><CodePage>0</CodePage><ZeroTerminate>1</ZeroTerminate><Address>gdstr+15A8</Address></CheatEntry><CheatEntry><ID>11</ID><Description>"Other age: sword"</Description><VariableType>String</VariableType><Length>64</Length><Unicode>0</Unicode><CodePage>0</CodePage><ZeroTerminate>1</ZeroTerminate><Address>gdstr+F78</Address></CheatEntry><CheatEntry><ID>12</ID><Description>"Other age: shield"</Description><VariableType>String</VariableType><Length>64</Length><Unicode>0</Unicode><CodePage>0</CodePage><ZeroTerminate>1</ZeroTerminate><Address>gdstr+E70</Address></CheatEntry><CheatEntry><ID>13</ID><Description>"Current map"</Description><VariableType>String</VariableType><Length>64</Length><Unicode>0</Unicode><CodePage>0</CodePage><ZeroTerminate>1</ZeroTerminate><Address>gdstr+1FF8</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>15</ID><Description>"Travel to another map (opens a window: pick map + spawn point)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not (LT and LT.gb and travelForm) then error("Enable 'Link tools' first") end
 travelForm()
 {$asm}
 [DISABLE]
@@ -668,12 +702,12 @@ if syntaxcheck then return end
 if TRAVEL_FORM then TRAVEL_FORM.hide() end
 {$asm}
 </AssemblerScript></CheatEntry>
-<CheatEntry><ID>8</ID><Description>"Link health"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>6</ID><Description>"Health (1 = quarter heart)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>4 Bytes</VariableType><Address>linkhp</Address></CheatEntry><CheatEntry><ID>7</ID><Description>"Max health (4 per heart)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>4 Bytes</VariableType><Address>linkhpmax</Address></CheatEntry></CheatEntries></CheatEntry>
-<CheatEntry><ID>12</ID><Description>"Link position (double, writable = teleport)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>9</ID><Description>"X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos</Address></CheatEntry><CheatEntry><ID>10</ID><Description>"Y (physics = world Y + 0.585)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos+8</Address></CheatEntry><CheatEntry><ID>11</ID><Description>"Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos+10</Address></CheatEntry></CheatEntries></CheatEntry>
-<CheatEntry><ID>24</ID><Description>"Link motion (read-only: game rewrites these every frame)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>13</ID><Description>"Velocity X (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+388</Address></CheatEntry><CheatEntry><ID>14</ID><Description>"Velocity Y (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+38C</Address></CheatEntry><CheatEntry><ID>15</ID><Description>"Velocity Z (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+390</Address></CheatEntry><CheatEntry><ID>16</ID><Description>"Turn rate (rad/s, + = left)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+398</Address></CheatEntry><CheatEntry><ID>17</ID><Description>"Facing X (sin)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+330</Address></CheatEntry><CheatEntry><ID>18</ID><Description>"Facing Z (cos)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+328</Address></CheatEntry><CheatEntry><ID>19</ID><Description>"Speed horizontal (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc</Address></CheatEntry><CheatEntry><ID>20</ID><Description>"Speed 3D (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+4</Address></CheatEntry><CheatEntry><ID>21</ID><Description>"Accel horizontal (calc, units/s^2)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+8</Address></CheatEntry><CheatEntry><ID>22</ID><Description>"Heading deg (calc, 0 = +Z)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+C</Address></CheatEntry><CheatEntry><ID>23</ID><Description>"Vertical speed (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+10</Address></CheatEntry></CheatEntries></CheatEntry>
-<CheatEntry><ID>31</ID><Description>"Camera (from player data, read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>25</ID><Description>"Camera X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam</Address></CheatEntry><CheatEntry><ID>26</ID><Description>"Camera Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam+4</Address></CheatEntry><CheatEntry><ID>27</ID><Description>"Camera Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam+8</Address></CheatEntry><CheatEntry><ID>28</ID><Description>"Camera yaw deg (calc, direction it looks, 0 = +Z)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+14</Address></CheatEntry><CheatEntry><ID>29</ID><Description>"Camera pitch deg (calc, - = looking down)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+18</Address></CheatEntry><CheatEntry><ID>30</ID><Description>"Camera distance from Link (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+1C</Address></CheatEntry></CheatEntries></CheatEntry>
-<CheatEntry><ID>39</ID><Description>"Game camera (read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>32</ID><Description>"Position X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+38</Address></CheatEntry><CheatEntry><ID>33</ID><Description>"Position Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+3C</Address></CheatEntry><CheatEntry><ID>34</ID><Description>"Position Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+40</Address></CheatEntry><CheatEntry><ID>35</ID><Description>"Look-at X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+44</Address></CheatEntry><CheatEntry><ID>36</ID><Description>"Look-at Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+48</Address></CheatEntry><CheatEntry><ID>37</ID><Description>"Look-at Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+4C</Address></CheatEntry><CheatEntry><ID>38</ID><Description>"FOV (radians)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+130</Address></CheatEntry></CheatEntries></CheatEntry>
-<CheatEntry><ID>43</ID><Description>"Link position (display, read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>40</ID><Description>"X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+29C</Address></CheatEntry><CheatEntry><ID>41</ID><Description>"Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+2A0</Address></CheatEntry><CheatEntry><ID>42</ID><Description>"Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+2A4</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>18</ID><Description>"Link health"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>16</ID><Description>"Health (1 = quarter heart)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>4 Bytes</VariableType><Address>linkhp</Address></CheatEntry><CheatEntry><ID>17</ID><Description>"Max health (4 per heart)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>4 Bytes</VariableType><Address>linkhpmax</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>22</ID><Description>"Link position (double, writable = teleport)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>19</ID><Description>"X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos</Address></CheatEntry><CheatEntry><ID>20</ID><Description>"Y (physics = world Y + 0.585)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos+8</Address></CheatEntry><CheatEntry><ID>21</ID><Description>"Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos+10</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>34</ID><Description>"Link motion (read-only: game rewrites these every frame)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>23</ID><Description>"Velocity X (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+388</Address></CheatEntry><CheatEntry><ID>24</ID><Description>"Velocity Y (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+38C</Address></CheatEntry><CheatEntry><ID>25</ID><Description>"Velocity Z (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+390</Address></CheatEntry><CheatEntry><ID>26</ID><Description>"Turn rate (rad/s, + = left)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+398</Address></CheatEntry><CheatEntry><ID>27</ID><Description>"Facing X (sin)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+330</Address></CheatEntry><CheatEntry><ID>28</ID><Description>"Facing Z (cos)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+328</Address></CheatEntry><CheatEntry><ID>29</ID><Description>"Speed horizontal (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc</Address></CheatEntry><CheatEntry><ID>30</ID><Description>"Speed 3D (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+4</Address></CheatEntry><CheatEntry><ID>31</ID><Description>"Accel horizontal (calc, units/s^2)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+8</Address></CheatEntry><CheatEntry><ID>32</ID><Description>"Heading deg (calc, 0 = +Z)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+C</Address></CheatEntry><CheatEntry><ID>33</ID><Description>"Vertical speed (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+10</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>41</ID><Description>"Camera (from player data, read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>35</ID><Description>"Camera X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam</Address></CheatEntry><CheatEntry><ID>36</ID><Description>"Camera Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam+4</Address></CheatEntry><CheatEntry><ID>37</ID><Description>"Camera Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam+8</Address></CheatEntry><CheatEntry><ID>38</ID><Description>"Camera yaw deg (calc, direction it looks, 0 = +Z)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+14</Address></CheatEntry><CheatEntry><ID>39</ID><Description>"Camera pitch deg (calc, - = looking down)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+18</Address></CheatEntry><CheatEntry><ID>40</ID><Description>"Camera distance from Link (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+1C</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>49</ID><Description>"Game camera (read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>42</ID><Description>"Position X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+38</Address></CheatEntry><CheatEntry><ID>43</ID><Description>"Position Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+3C</Address></CheatEntry><CheatEntry><ID>44</ID><Description>"Position Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+40</Address></CheatEntry><CheatEntry><ID>45</ID><Description>"Look-at X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+44</Address></CheatEntry><CheatEntry><ID>46</ID><Description>"Look-at Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+48</Address></CheatEntry><CheatEntry><ID>47</ID><Description>"Look-at Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+4C</Address></CheatEntry><CheatEntry><ID>48</ID><Description>"FOV (radians)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+130</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>53</ID><Description>"Link position (display, read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>50</ID><Description>"X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+29C</Address></CheatEntry><CheatEntry><ID>51</ID><Description>"Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+2A0</Address></CheatEntry><CheatEntry><ID>52</ID><Description>"Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+2A4</Address></CheatEntry></CheatEntries></CheatEntry>
 </CheatEntries>
 <UserdefinedSymbols/>
 </CheatTable>
