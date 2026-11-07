@@ -262,6 +262,31 @@ class Game:
         c = self.seq_slots()
         if c: self.write(c[k], text.encode()[:0x3F].ljust(0x40, b'\0'))
 
+    def drop_slots(self, lo=0x2140000000, hi=0x2160000000):
+        """{guest address: (drop table, drop actor)} for every live Drop blackboard (pots, grass, rocks, chests...).
+        Each is a 16-byte header, three pointers, then three String128 objects {ptr -> buf, cap 0x80, buf[0x80]}."""
+        gb = self.addr.get('gb')
+        hdr = b'\x04\0\0\0\x04\0\0\0\x04\0\0\0\0\0\0\0'
+        out, a, m = {}, gb + lo, MBI()
+        while a < gb + hi and k32.VirtualQueryEx(self.h, a, ctypes.byref(m), ctypes.sizeof(m)):
+            if m.State == 0x1000 and m.Protect in (0x04, 0x40):
+                for off in range(0, m.RegionSize, 1 << 25):
+                    base = m.BaseAddress + off
+                    buf = self.raw(base, min((1 << 25) + 0x200, m.RegionSize - off))
+                    j = buf.find(hdr) if buf else -1
+                    while j != -1 and j < 1 << 25:
+                        x = base + j + 0x30 - gb
+                        b = buf[j + 0x30:j + 0x30 + 0x1B0]
+                        if len(b) == 0x1B0 and all(struct.unpack_from('<QI', b, k * 0x90) == (x + k * 0x90 + 0x10, 0x80) for k in range(3)):
+                            table, actor = (b[k * 0x90 + 0x10:k * 0x90 + 0x90].split(b'\0')[0] for k in range(2))
+                            if not table or table.startswith((b'Drop', b'None')): out[x] = (table.decode('latin1'), actor.decode('latin1'))
+                        j = buf.find(hdr, j + 1)
+            a = m.BaseAddress + m.RegionSize
+        return out
+
+    def set_drop(self, slot, actor):
+        self.write(slot + 0xA0, actor.encode()[:0x7F].ljust(0x80, b'\0'))
+
     def write_u32(self, guest, value):
         if not self.write(guest, struct.pack('<I', value & 0xFFFFFFFF)):
             ce('writeInteger(%d, %d) return 1' % (self.addr['gb'] + guest, value))

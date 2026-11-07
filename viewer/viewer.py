@@ -7,7 +7,7 @@ from PySide6.QtOpenGL import QOpenGLShaderProgram, QOpenGLShader, QOpenGLBuffer,
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QCheckBox, QLabel, QPushButton, QComboBox, QMenu,
                                QDialog, QDoubleSpinBox, QFormLayout, QDialogButtonBox, QLineEdit, QListWidget, QListWidgetItem, QScrollArea,
-                               QSlider, QRadioButton, QButtonGroup, QFrame, QFileDialog, QMessageBox, QProgressDialog)
+                               QSlider, QRadioButton, QButtonGroup, QFrame, QFileDialog, QMessageBox, QProgressDialog, QInputDialog)
 
 import romfs, havok, build_data
 from byml import Byml
@@ -710,6 +710,9 @@ class GLView(QOpenGLWidget):
 
 GIZMO_LEN = 2.0
 RUNTIME = 0xFFFF000000000000
+BREAKABLES = ('Obj_Pot', 'Obj_Plant_Grass', 'Obj_LiftRock', 'Obj_BrokenBox', 'Obj_BrokenRock', 'Obj_Kokiri_Beehive', 'Land_kokiri_Plant')
+DROP_SUGGESTIONS = ['Obj_TBox_A_02_NoBake', 'Obj_Plant_MagicBeanLeaf_A_02', 'Obj_Graveyard_Tombstone_A_01', 'Obj_Tombstone_A_01',
+                    'Obj_Pot_A_04', 'Obj_Heart_Piece', 'Obj_Fairy', 'Obj_Rupee_Red', 'Obj_Bomb', 'Item_Bombchu', 'Animal_Insect']
 SKIP_ACTORS = ('Land_', 'Player', 'Weapon_', 'Armor_', 'Item_Ocarina', 'Camera', 'Event', 'Sound', 'Area', 'Post',
                'Forbid', 'Ground', 'Interest', 'Sky', 'Weather', 'Env', 'Light', 'Fog')
 EFFECT_ACTORS = {'DustArea', 'VolumeFogArea', 'Obj_Gerudo_QuickSand_A_01'}
@@ -740,6 +743,7 @@ class App(QWidget):
         self.hidden_version, self.obj_live_keys, self.dyn_picks, self.dyn = 0, None, [], []
         self.disabled, self.loaded, self.selected = {}, {}, None
         self.moved, self.models, self.gizmo, self.pins, self.live_all, self.live_named, self.runtime = {}, {}, None, {}, {}, {}, {}
+        self.drop_orig = {}
         self.target = None
         self.selection = set()
         self.saved_bodies, self.path_body = {}, None
@@ -800,6 +804,10 @@ class App(QWidget):
         row = QHBoxLayout()
         b = QPushButton('Kill death zones'); b.setToolTip('Move every loaded fall-down / quicksand trigger out of the world'); b.clicked.connect(self.disable_death_zones); row.addWidget(b)
         b = QPushButton('Restore zones'); b.clicked.connect(self.restore_bodies); row.addWidget(b)
+        sl.addLayout(row)
+        row = QHBoxLayout()
+        b = QPushButton('Breakables drop...'); b.setToolTip('Pots, grass, rocks etc. loaded right now spawn the chosen actor when broken'); b.clicked.connect(self.drop_menu); row.addWidget(b)
+        b = QPushButton('Pull one to Link'); b.setToolTip('Move the nearest pot / grass / rock in front of Link'); b.clicked.connect(self.pull_breakable); row.addWidget(b)
         sl.addLayout(row)
         self.on_path = QCheckBox('Keep Link on the safe path (no send-back)'); self.on_path.toggled.connect(self.toggle_path); sl.addWidget(self.on_path)
         self.travel_btn = QPushButton('Travel to another map...'); self.travel_btn.clicked.connect(self.travel_menu); sl.addWidget(self.travel_btn)
@@ -1179,6 +1187,39 @@ class App(QWidget):
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel); form.addRow(bb)
         bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
         if dlg.exec(): self.place(h, [b.value() for b in boxes])
+
+    def drop_menu(self):
+        name, ok = QInputDialog.getItem(self, 'Breakables drop', 'Actor to spawn when a pot / grass / rock breaks\n(empty = restore the original drops):',
+                                        [''] + DROP_SUGGESTIONS, 1, True)
+        if not ok: return
+        def run():
+            slots = self.game.drop_slots()
+            for x, (t, a) in slots.items(): self.drop_orig.setdefault(x, a)
+            if name.strip():
+                for x in slots: self.game.set_drop(x, name.strip())
+                self.zone_msg = '%d breakables now drop %s (re-run after a map change)' % (len(slots), name.strip())
+            else:
+                for x, a in self.drop_orig.items():
+                    if x in slots: self.game.set_drop(x, a)
+                self.drop_orig = {}
+                self.zone_msg = 'restored the drops of %d breakables' % len(slots)
+        threading.Thread(target=run, daemon=True).start()
+
+    def pull_breakable(self):
+        s = self.state
+        if not s or not s['face']: return
+        best = None
+        for name, acts in self.live_named.items():
+            if not name.startswith(BREAKABLES): continue
+            for a in acts:
+                p = self.game.actor_pos(a)
+                if not p or sum(map(abs, p)) < 0.01: continue
+                d = (p[0] - s['x']) ** 2 + (p[2] - s['z']) ** 2
+                if best is None or d < best[0]: best = (d, a, name)
+        if not best:
+            self.zone_msg = 'no pot / grass / rock loaded here'; return
+        h = next((k for k, (a, n) in self.runtime.items() if a == best[1]), None) or next((k for k, a in self.live_all.items() if a == best[1]), None) or (RUNTIME | best[1])
+        self.place(h, [s['x'] + s['face'][0] * 1.5, s['y'] - 0.5, s['z'] + s['face'][1] * 1.5])
 
     def send_away(self, h):
         a = self.live_actor(h)
