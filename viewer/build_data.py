@@ -216,8 +216,26 @@ def build(progress=print):
                 out.append({'scene': scene, 'name': label or re.search(r'Module/([^/]+)/', logic).group(1), 'hash': a['Hash'],
                             'kind': kind, 'polys': polys})
     json.dump(out, open(os.path.join(HERE, 'geom.json'), 'w'))
+    json.dump(entrances(), open(os.path.join(HERE, 'entrances.json'), 'w'))
     json.dump({'actors': live_actors, 'boxes': boxes, 'shapes': {k: v for k, v in shapes.items() if v}},
               open(os.path.join(HERE, 'actors.json'), 'w'))
+    return out
+
+
+def entrances():
+    """Every loading zone: [source scene, child target, adult target, spawn point, arrival event, position]."""
+    out = []
+    root = romfs.path('Banc')
+    for area in sorted(os.listdir(root)):
+        folder = os.path.join(root, area)
+        if not os.path.isdir(folder): continue
+        for f in sorted(os.listdir(folder)):
+            if not f.endswith('.bcett.byml.zs'): continue
+            for a in Byml(romfs.read('Banc', area, f)).root.get('Actors', []):
+                d = a.get('Dynamic') or {}
+                if d.get('NextStartPosName') or d.get('NextBancParamNameChild'):
+                    out.append([f.split('.')[0], d.get('NextBancParamNameChild'), d.get('NextBancParamNameAdult'),
+                                d.get('NextStartPosName'), d.get('NextEventName'), a.get('Translate', [0, 0, 0])])
     return out
 
 
