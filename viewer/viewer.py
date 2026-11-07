@@ -323,10 +323,10 @@ class GLView(QOpenGLWidget):
         menu = QMenu(self)
         pt = self.pick_point
         if h:
-            name = self.app.data.hash_name.get(h) or self.app.data.name_of(h) or 'object %x' % h
+            name = self.app.name_of(h) or 'object %x' % h
             menu.addAction('%s' % name).setEnabled(False)
             menu.addAction('Copy coords of this point (%.2f, %.2f, %.2f)' % tuple(pt), lambda: self.app.copy_coords(pt))
-            live = self.app.live_actor(h)
+            live = self.app.live_actor(h, pt)
             if live:
                 pos = self.app.game.actor_pos(live)
                 if pos: menu.addAction('Copy object position (%.2f, %.2f, %.2f)' % tuple(pos), lambda: self.app.copy_coords(pos))
@@ -336,7 +336,7 @@ class GLView(QOpenGLWidget):
                 if h in self.app.moved:
                     menu.addAction('Put it back where it was', lambda: self.app.put_back(h))
             menu.addAction('Hide this in the viewer', lambda: self.app.hide(h))
-            if self.app.baked_tiles(h) and not live:
+            if self.app.baked_tiles(h):
                 if h in self.app.disabled:
                     menu.addAction('Re-enable collision in game', lambda: self.app.set_collision(h, True))
                 else:
@@ -602,6 +602,16 @@ class GLView(QOpenGLWidget):
 
 
 GIZMO_LEN = 2.0
+RUNTIME = 0xFFFF000000000000
+
+
+def _box(w, h):
+    c = np.array([[x, y, z] for x in (-w, w) for y in (0, h) for z in (-w, w)], np.float32)
+    f = [(0, 1, 3), (0, 3, 2), (4, 6, 7), (4, 7, 5), (0, 4, 5), (0, 5, 1), (2, 3, 7), (2, 7, 6), (0, 2, 6), (0, 6, 4), (1, 5, 7), (1, 7, 3)]
+    return c[np.array(f)]
+
+
+BOX = _box(0.4, 1.6)
 
 
 class App(QWidget):
@@ -617,7 +627,7 @@ class App(QWidget):
         self.manual, self.actor_version, self.detected = None, 0, set()
         self.hidden_version, self.obj_live_keys, self.dyn_picks, self.dyn = 0, None, [], []
         self.disabled, self.loaded, self.selected = {}, {}, None
-        self.moved, self.models, self.gizmo, self.pins, self.live_all = {}, {}, None, {}, {}
+        self.moved, self.models, self.gizmo, self.pins, self.live_all, self.live_named, self.runtime = {}, {}, None, {}, {}, {}, {}
         try:
             self.hidden_keys = np.array(json.load(open(os.path.join(HERE, 'hidden.json'))), np.uint64)
         except Exception:
@@ -706,7 +716,7 @@ class App(QWidget):
         if done:
             self.disabled[h] = done
             self.zone_msg = 'disabled %s: %d piece(s) at %s - move Link to wake physics' % (
-                self.data.name_of(h) or hex(h), len(done), ', '.join('%X' % a for a, _ in done[:3]))
+                self.name_of(h) or hex(h), len(done), ', '.join('%X' % a for a, _ in done[:3]))
         else:
             self.zone_msg = 'nothing to disable: that piece is not in memory or the game already switched it off'
 
@@ -731,8 +741,24 @@ class App(QWidget):
         self.loaded[path] = base
         return base
 
-    def live_actor(self, h):
-        return self.actor_objs.get(h) or self.obj_actors.get(h) or self.live_all.get(h)
+    def name_of(self, h):
+        if h in self.runtime: return self.runtime[h][1] + ' (spawned)'
+        return self.data.hash_name.get(h) or self.data.name_of(h)
+
+    def live_actor(self, h, near=None):
+        """Live actor for a placement id; falls back to the nearest live actor of the same name."""
+        a = self.actor_objs.get(h) or self.obj_actors.get(h) or self.live_all.get(h)
+        if a or near is None: return a
+        name = self.data.hash_name.get(h) or self.data.name_of(h)
+        if h in self.runtime: return self.runtime[h][0]
+        best = None
+        for c in self.live_named.get(name, []):
+            p = self.game.actor_pos(c)
+            if not p: continue
+            d = float(np.linalg.norm(np.array(p) - near))
+            if d < 25 and (best is None or d < best[0]): best = (d, c)
+        if best: self.live_all[h] = best[1]
+        return best[1] if best else None
 
     def model_of(self, h):
         """Model transform object of a live actor, matched by position (cached)."""
@@ -740,22 +766,28 @@ class App(QWidget):
         if not a: return None
         m = self.models.get(h)
         pos = self.game.actor_pos(a)
-        if m and pos and np.linalg.norm(np.array(self.game.model_pos(m) or (1e9,) * 3) - pos) < 0.05: return m
+        if m and pos and np.linalg.norm(np.array(self.game.model_pos(m) or (1e9,) * 3) - pos) < 1.0: return m
         if not pos: return None
         best = None
         for addr, p in self.game.models():
             d = float(np.linalg.norm(np.array(p) - pos))
-            if d < 0.05 and (best is None or d < best[0]): best = (d, addr)
+            if d < 1.0 and (best is None or d < best[0]): best = (d, addr)
         self.models[h] = best[1] if best else None
         return self.models[h]
 
     def place(self, h, pos):
         a, m = self.live_actor(h), self.model_of(h)
         if not a: return
-        if h not in self.moved: self.moved[h] = tuple(self.game.actor_pos(a) or pos)
-        self.game.move(a, m, pos)
-        self.pins[h] = (a, m, tuple(pos))
-        self.zone_msg = 'moved %s to %.2f %.2f %.2f%s' % (self.data.name_of(h) or hex(h), *pos, '' if m else ' (no model found: collision only)')
+        pin = self.pins.get(h)
+        if pin:
+            ref, mref = pin[2], pin[3]
+        else:
+            ref, mref = self.game.actor_pos(a) or pos, self.game.model_pos(m) if m else None
+            self.moved[h] = (tuple(ref), mref)
+        mpos = tuple(mr + p - r for mr, p, r in zip(mref, pos, ref)) if mref else None
+        self.game.move(a, m, pos, mpos)
+        self.pins[h] = (a, m, tuple(pos), mpos)
+        self.zone_msg = 'moved %s to %.2f %.2f %.2f%s' % (self.name_of(h) or hex(h), *pos, '' if m else ' (no model found: collision only)')
 
     def gizmo_pos(self):
         if not self.gizmo: return None
@@ -785,7 +817,7 @@ class App(QWidget):
         a = self.live_actor(h)
         cur = self.game.actor_pos(a) if a else None
         if not cur: return
-        dlg = QDialog(self); dlg.setWindowTitle('Set position: ' + (self.data.name_of(h) or hex(h)))
+        dlg = QDialog(self); dlg.setWindowTitle('Set position: ' + (self.name_of(h) or hex(h)))
         form = QFormLayout(dlg); boxes = []
         for lab, v in zip('XYZ', cur):
             b = QDoubleSpinBox(); b.setRange(-100000, 100000); b.setDecimals(3); b.setValue(v); form.addRow(lab, b); boxes.append(b)
@@ -797,24 +829,26 @@ class App(QWidget):
         a = self.live_actor(h)
         cur = self.game.actor_pos(a) if a else None
         if cur: self.place(h, [cur[0], cur[1] - 2000, cur[2]])
+        if self.baked_tiles(h) and h not in self.disabled: self.set_collision(h, False)
 
     def put_back(self, h):
         orig = self.moved.get(h)
         if orig is None: return
         a, m = self.live_actor(h), self.models.get(h)
-        self.game.move(a, m, orig)
+        self.game.move(a, m, orig[0], orig[1])
         self.moved.pop(h, None); self.pins.pop(h, None)
         if self.gizmo == h: self.gizmo = None
-        self.zone_msg = 'put back ' + (self.data.name_of(h) or hex(h))
+        self.zone_msg = 'put back ' + (self.name_of(h) or hex(h))
 
     def put_back_all(self):
         for h in list(self.moved): self.put_back(h)
 
     def keep_pins(self):
         """Physics objects get their transform rewritten by the game; hold moved ones in place."""
-        for h, (a, m, pos) in list(self.pins.items()):
-            cur = self.game.model_pos(m) if m else self.game.actor_pos(a)
-            if cur and np.linalg.norm(np.array(cur) - pos) > 0.02: self.game.move(a, m, pos)
+        for h, (a, m, pos, mpos) in list(self.pins.items()):
+            cur, mcur = self.game.actor_pos(a), self.game.model_pos(m) if m else None
+            if (cur and np.linalg.norm(np.array(cur) - pos) > 0.02) or (mcur and mpos and np.linalg.norm(np.array(mcur) - mpos) > 0.02):
+                self.game.move(a, m, pos, mpos)
 
     def restore_all(self):
         for h in list(self.disabled): self.set_collision(h, True)
@@ -836,7 +870,7 @@ class App(QWidget):
         for h, name, pos, R, scale, rgb, alpha in self.dyn:
             if h in hidden: continue
             t = self.data.shapes.get(name)
-            if t is None: continue
+            if t is None: t = BOX
             w = (t * np.array(scale, np.float32)) @ R.T + np.array(pos, np.float32)
             out.append(vertices(w, rgb, alpha)); picks.append((w, np.full(len(w), h, np.uint64)))
         self.dyn_picks = picks
@@ -868,9 +902,14 @@ class App(QWidget):
                     best = max(ratio, key=ratio.get)
                     grp = re.sub(r'_(Static|Dynamic)$', '', best)
                     act = {s for s in ratio if re.sub(r'_(Static|Dynamic)$', '', s) == grp}
-                live = {}
+                live, named, runtime = {}, {}, {}
                 for a, (name, h) in self.game.actors().items():
+                    named.setdefault(name, []).append(a)
                     if h and h != 0xFFFFFFFFFFFFFFFF: live.setdefault(h, a)
+                    elif name.split('_')[0] in ('Npc', 'Enemy', 'Animal', 'Obj', 'Item'):
+                        runtime[RUNTIME | a] = (a, name)
+                self.runtime = runtime
+                self.live_named = named
                 for h, recs in found.items():
                     if h in live: continue
                     for r in recs:
@@ -882,6 +921,7 @@ class App(QWidget):
                 self.live_keys = np.array(sorted(live), np.uint64)
                 self.live_all = live
                 self.actor_objs = {h: o for h, o in live.items() if h in self.data.actors}
+                self.actor_objs.update({k: a for k, (a, n) in runtime.items()})
                 self.obj_actors = {h: o for h, o in live.items() if h in self.data.obj_pos}
                 self.live_version += 1
                 self.last_scan = time.time()
@@ -922,7 +962,7 @@ class App(QWidget):
                         name, scale = self.data.obj_info[h]
                         rgb, alpha = KCOL['object']
                     else:
-                        name, scale = self.data.actors[h], [1, 1, 1]
+                        name, scale = self.data.actors.get(h) or self.runtime[h][1], [1, 1, 1]
                         c = ACTOR_COL.get(name.split('_')[0], QColor('white')); rgb, alpha = (c.red(), c.green(), c.blue()), 110
                         markers.append((name, pos))
                     R = self.game.actor_rot(obj)

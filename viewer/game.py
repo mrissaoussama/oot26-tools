@@ -145,11 +145,12 @@ class Game:
         got = ctypes.c_size_t()
         return bool(self.h and k32.WriteProcessMemory(self.h, self.addr['gb'] + guest, data, len(data), ctypes.byref(got)))
 
-    def move(self, actor, model, pos):
-        """Write a new world position into the model matrix (both copies) and the actor."""
-        for k, v in zip((0xC, 0x1C, 0x2C), pos):
-            b = struct.pack('<f', v)
-            if model: self.write(model + 0xA0 + k, b); self.write(model + 0xD0 + k, b)
+    def move(self, actor, model, pos, mpos=None):
+        """Write the actor position and (both copies of) its model matrix translation."""
+        if model and mpos:
+            for k, v in zip((0xC, 0x1C, 0x2C), mpos):
+                b = struct.pack('<f', v)
+                self.write(model + 0xA0 + k, b); self.write(model + 0xD0 + k, b)
         if actor: self.write(actor + 0x31C, struct.pack('<3f', *pos))
 
     def model_pos(self, model):
