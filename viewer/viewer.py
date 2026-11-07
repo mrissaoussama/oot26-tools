@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, 
                                QSlider, QRadioButton, QButtonGroup, QFrame, QFileDialog, QMessageBox, QProgressDialog)
 
 import romfs, havok, build_data
+from byml import Byml
 from game import Game
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -18,11 +19,13 @@ KINDS = [  # key, label, rgb, alpha, shown by default
     ('climb', 'Climb-only walls', (255, 176, 0), 90, True),
     ('push', 'Push walls (doors etc.)', (64, 160, 255), 80, False),
     ('other', 'Enemy / horse / camera walls', (160, 160, 160), 60, False),
+    ('object', 'Objects (pots, chests, blocks...)', (205, 150, 90), 140, True),
     ('void', 'Void-out zones', (210, 60, 255), 80, True),
     ('norespawn', 'No-respawn areas', (64, 224, 208), 50, False),
     ('whirlpool', 'Whirlpools', (32, 96, 255), 60, False),
 ]
 KCOL = {k: (c, a) for k, _, c, a, _ in KINDS}
+ACTOR_COL = {'Enemy': QColor(255, 70, 70), 'Npc': QColor(255, 220, 60), 'Animal': QColor(90, 220, 255), 'Obj': QColor(120, 255, 120), 'Item': QColor(120, 255, 120)}
 GL_FLOAT, GL_TRIANGLES, GL_LINES = 0x1406, 0x0004, 0x0001
 
 VS = """
@@ -45,7 +48,7 @@ class Data:
         sid = {s: i for i, s in enumerate(self.scene_names)}
         self.kind_names = [k for k, *_ in KINDS]
         kid = {k: i for i, k in enumerate(self.kind_names)}
-        tris, tk, ts, segs, sk, ss = [], [], [], [], [], []
+        tris, tk, ts, th, segs, sk, ss, sh = [], [], [], [], [], [], [], []
         self.scene_items = {}
         for o in geom:
             self.scene_items.setdefault(o['scene'], set()).add(int(o['hash']))
@@ -53,14 +56,17 @@ class Data:
             for poly in o['polys']:
                 p = np.asarray(poly, np.float32)
                 t = np.stack([np.repeat(p[:1], len(p) - 2, 0), p[1:-1], p[2:]], 1)
-                tris.append(t); tk += [k] * len(t); ts += [s] * len(t)
+                tris.append(t); tk += [k] * len(t); ts += [s] * len(t); th += [int(o['hash'])] * len(t)
                 e = np.stack([p, np.roll(p, -1, 0)], 1)
-                segs.append(e); sk += [k] * len(e); ss += [s] * len(e)
-        self.wt, self.wk, self.ws = np.concatenate(tris), np.array(tk), np.array(ts)
+                segs.append(e); sk += [k] * len(e); ss += [s] * len(e); sh += [int(o['hash'])] * len(e)
+        self.wt, self.wk, self.ws, self.wh = np.concatenate(tris), np.array(tk), np.array(ts), np.array(th, np.uint64)
+        self.lh = np.array(sh, np.uint64)
+        apath = os.path.join(HERE, 'actors.json')
+        self.actors = {int(h): n for h, n in json.load(open(apath)).items()} if os.path.exists(apath) else {}
         self.wc = self.wt.mean(1)
         self.ls, self.lk, self.lss = np.concatenate(segs), np.array(sk), np.array(ss)
         self.lc = self.ls.mean(1)
-        self.terrain, self.loading, self.tiles, self.bounds = {}, set(), {}, {}
+        self.terrain, self.loading, self.tiles, self.bounds, self.names = {}, set(), {}, {}, {}
 
     def terrain_near(self, scenes, x, z, rng):
         out, pending = [], 0
@@ -81,11 +87,23 @@ class Data:
                     pending += 1
                     if path not in self.loading:
                         self.loading.add(path)
-                        threading.Thread(target=self._load, args=(path, key, tiles), daemon=True).start()
+                        threading.Thread(target=self._load, args=(path, key, tiles, sc), daemon=True).start()
         return out, pending
 
-    def _load(self, path, key, tiles):
-        t = havok.load_tile(path, key, tiles)
+    def names_for(self, scene):
+        """Placement hash -> actor name for every layer of the scene's area (Static/Dynamic, both ages)."""
+        area = scene.split('_')[0]
+        if area not in self.names:
+            d = {}
+            folder = romfs.path('Banc', area)
+            for f in os.listdir(folder) if os.path.isdir(folder) else []:
+                if f.endswith('.bcett.byml.zs'):
+                    for a in Byml(romfs.read('Banc', area, f)).root.get('Actors', []): d[a['Hash']] = a.get('Gyaml', '')
+            self.names[area] = d
+        return self.names[area]
+
+    def _load(self, path, key, tiles, scene):
+        t = havok.load_tile(path, key, tiles, self.names_for(scene))
         c = t.mean(1) if len(t) else np.zeros((0, 3), np.float32)
         self.bounds[path] = (c.min(0), c.max(0)) if len(t) else (np.full(3, 1e9), np.full(3, -1e9))
         self.terrain[path] = (t, c)
@@ -175,21 +193,26 @@ class GLView(QOpenGLWidget):
         height = app.only_height.isChecked()
         ceil = app.no_ceiling.isChecked() and self.mode != 'game'
         key = (round(lx / (rng / 4)), round(lz / (rng / 4)), round(ly / 2) if height or ceil else 0, ceil, rng, tuple(sorted(show.items())),
-               app.only_zone.isChecked(), height, tuple(sorted(app.active or ())), len(d.terrain))
+               app.only_zone.isChecked(), height, tuple(sorted(app.active or ())), len(d.terrain),
+               app.only_live.isChecked(), app.live_version)
         if key == self.build_key: return
         self.build_key = key
         zone_ids = [i for i, n in enumerate(d.scene_names) if n in (app.active or ())]
-        def sel(c, ks, ss, k):
+        live = app.only_live.isChecked() and app.found_keys is not None and len(app.found_keys) > 0
+        obj = d.kind_names.index('object')
+        def sel(c, ks, ss, k, hs):
             m = (np.abs(c[:, 0] - lx) < rng) & (np.abs(c[:, 2] - lz) < rng) & (ks == k)
             if app.only_zone.isChecked() and app.active: m &= np.isin(ss, zone_ids)
+            # Objects are actors: draw only existing ones. Walls can be baked, so only drop those absent from memory.
+            if live: m &= np.isin(hs, app.live_keys if k == obj else app.found_keys)
             return m
         trans, lines, opaque = [], [], []
         for i, k in enumerate(d.kind_names):
             if k == 'terrain' or not show[k]: continue
-            m = sel(d.wc, d.wk, d.ws, i)
+            m = sel(d.wc, d.wk, d.ws, i, d.wh)
             if height: m &= (d.wt[:, :, 1].max(1) > ly - 4) & (d.wt[:, :, 1].min(1) < ly + 12)
             if m.any(): trans.append(vertices(d.wt[m], *KCOL[k]))
-            ml = sel(d.lc, d.lk, d.lss, i)
+            ml = sel(d.lc, d.lk, d.lss, i, d.lh)
             if ml.any(): lines.append(line_vertices(d.ls[ml], KCOL[k][0]))
         pending = 0
         if show['terrain'] and app.active:
@@ -249,6 +272,17 @@ class GLView(QOpenGLWidget):
             a = scr(s['x'], s['y'] + 0.9, s['z'])
             b = scr(s['x'] + s['face'][0] * 1.5, s['y'] + 0.9, s['z'] + s['face'][1] * 1.5)
             if a and b: p.setPen(QPen(QColor(64, 255, 96), 2)); p.drawLine(a, b)
+        if self.app.show_actors.isChecked():
+            p.setFont(QFont('Consolas', 8))
+            for name, (x, y, z) in self.app.actor_pos:
+                q = scr(x, y + 0.5, z)
+                if not q or not (0 <= q.x() <= W and 0 <= q.y() <= H): continue
+                col = ACTOR_COL.get(name.split('_')[0], QColor('white'))
+                p.setBrush(col); p.setPen(QPen(QColor('black'), 1))
+                p.drawPolygon([q + QPointF(0, -6), q + QPointF(6, 0), q + QPointF(0, 6), q + QPointF(-6, 0)])
+                if self.app.show_names.isChecked():
+                    p.setPen(col); p.drawText(q + QPointF(8, 4), name)
+            p.setFont(QFont('Consolas', 9))
         p.setPen(QColor('white'))
         p.drawText(8, 16, 'Link %.1f %.1f %.1f   %s' % (s['x'], s['y'], s['z'], self.app.zone_msg))
         p.drawText(8, H - 8, {'game': 'Game camera', 'orbit': 'Orbit: drag to rotate, wheel to zoom', 'top': 'Top-down: wheel to zoom'}[self.mode])
@@ -262,6 +296,8 @@ class App(QWidget):
         self.data = Data(geom)
         self.game = Game()
         self.state, self.active, self.zone_msg, self.scanning, self.last_pos = None, None, 'zone: detecting...', False, None
+        self.found_keys = self.live_keys = None
+        self.live_version, self.actor_objs, self.actor_pos, self.last_scan, self.last_actor_read = 0, {}, [], 0, 0
         lay = QHBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
         side = QFrame(); side.setFixedWidth(250); side.setStyleSheet('background:#1b2026; color:#d0d8e0')
         sl = QVBoxLayout(side)
@@ -276,7 +312,10 @@ class App(QWidget):
             cb = QCheckBox(label); cb.setChecked(on); cb.setStyleSheet('color: rgb(%d,%d,%d)' % rgb)
             self.showk[k] = cb; sl.addWidget(cb)
         sl.addWidget(QLabel('<b>Filters</b>'))
+        self.show_actors = QCheckBox('Enemies / NPCs / animals (live)'); self.show_actors.setChecked(True); sl.addWidget(self.show_actors)
+        self.show_names = QCheckBox('Actor names'); sl.addWidget(self.show_names)
         self.only_zone = QCheckBox('Only the loaded zone'); self.only_zone.setChecked(True); sl.addWidget(self.only_zone)
+        self.only_live = QCheckBox('Only things that exist right now'); self.only_live.setChecked(True); sl.addWidget(self.only_live)
         self.only_height = QCheckBox("Walls near Link's height only"); sl.addWidget(self.only_height)
         self.no_ceiling = QCheckBox('Hide ceilings (for dungeons)'); self.no_ceiling.setChecked(True); sl.addWidget(self.no_ceiling)
         b = QPushButton('Re-detect zone'); b.clicked.connect(self.detect); sl.addWidget(b)
@@ -303,14 +342,30 @@ class App(QWidget):
         """Loaded zones = zones whose placement IDs are present in the actor heap."""
         if self.scanning or not self.game.addr.get('gb'): return
         self.scanning = True
-        keys = np.array(sorted({h for s in self.data.scene_items.values() for h in s}), np.uint64)
+        keys = np.array(sorted({h for s in self.data.scene_items.values() for h in s} | set(self.data.actors)), np.uint64)
+        first = self.active is None
         def work():
             try:
                 t = time.time()
-                hit = self.game.scan_u64(keys, 0x2140000000, 0x2160000000,
-                                         lambda f: setattr(self, 'zone_msg', 'zone: scanning %d%%' % (f * 100)))
-                act = {s for s, hs in self.data.scene_items.items() if len(hs & hit) >= max(1, 0.9 * len(hs))}
+                found = self.game.scan_u64(keys, 0x2140000000, 0x2160000000,
+                                           (lambda f: setattr(self, 'zone_msg', 'zone: scanning %d%%' % (f * 100))) if first else None)
+                hit = set(found)
+                ratio = {s: len(hs & hit) / len(hs) for s, hs in self.data.scene_items.items() if hs}
+                areas = {}
+                for s, r in ratio.items(): areas[s.split('_')[0]] = areas.get(s.split('_')[0], 0) + r * len(self.data.scene_items[s])
+                best = max(areas, key=areas.get) if areas and max(areas.values()) > 0 else None
+                act = {s for s, r in ratio.items() if best and s.split('_')[0] == best and r >= 0.25}
+                live = {}
+                for h, recs in found.items():
+                    for r in recs:
+                        o = self.game.actor_of(r)
+                        if o: live[h] = o; break
                 self.active = act or None
+                self.found_keys = np.array(sorted(hit), np.uint64)
+                self.live_keys = np.array(sorted(live), np.uint64)
+                self.actor_objs = {h: o for h, o in live.items() if h in self.data.actors}
+                self.live_version += 1
+                self.last_scan = time.time()
                 self.zone_msg = 'zone: %s (%.0fs)' % (', '.join(sorted(act)) if act else 'not found, showing all', time.time() - t)
             except Exception as e:
                 self.zone_msg = 'zone scan failed: %r' % e
@@ -328,6 +383,16 @@ class App(QWidget):
             if self.last_pos is None or abs(s['x'] - self.last_pos[0]) + abs(s['z'] - self.last_pos[1]) > 15:
                 QTimer.singleShot(2000, self.detect)
             self.last_pos = (s['x'], s['z'])
+            if time.time() - self.last_scan > 20 and not self.scanning: self.detect()
+            if self.show_actors.isChecked() and time.time() - self.last_actor_read > 0.15:
+                self.last_actor_read = time.time()
+                rng = self.range.value()
+                out = []
+                for h, obj in self.actor_objs.items():
+                    pos = self.game.actor_pos(obj)
+                    if pos and sum(map(abs, pos)) > 0.01 and abs(pos[0] - s["x"]) < rng and abs(pos[2] - s['z']) < rng:
+                        out.append((self.data.actors[h], pos))
+                self.actor_pos = out
         self.view.update()
 
 

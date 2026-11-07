@@ -60,6 +60,17 @@ class Game:
         return {'view': np.array(struct.unpack_from('<12f', b, 8), np.float32).reshape(3, 4),
                 'fovy': struct.unpack_from('<f', b, 0x130)[0]}
 
+    def actor_of(self, rec):
+        """Actor object behind a placement record (rec = address of its placement hash), or None."""
+        gb, M = self.addr.get('gb'), self.addr.get('M')
+        p = self.read(gb + rec - 0x28, '<Q')
+        if not p or not 0x2000000000 <= p[0] < 0x2400000000 or p[0] % 8: return None
+        v = self.read(gb + p[0], '<Q')
+        return p[0] if v and M <= v[0] < M + 0x6000000 else None
+
+    def actor_pos(self, actor):
+        return self.read(self.addr.get('gb') + actor + 0x31C, '<3f')
+
     def state(self):
         self.refresh()
         p = self.read(self.addr.get('linkpos'), '<3d')
@@ -69,16 +80,17 @@ class Game:
         return {'x': p[0], 'y': p[1] - 0.585, 'z': p[2], 'face': (f[2], f[0]) if f else None, 'cam': self.camera()}
 
     def scan_u64(self, keys, lo, hi, progress=None):
-        """Which of keys (sorted np.uint64) exist in guest memory [lo, hi)."""
+        """{key: [guest addresses]} for keys (sorted np.uint64) found in guest memory [lo, hi)."""
         gb = self.addr.get('gb')
-        found, a, m = set(), gb + lo, MBI()
+        found, a, m = {}, gb + lo, MBI()
         while a < gb + hi and k32.VirtualQueryEx(self.h, a, ctypes.byref(m), ctypes.sizeof(m)):
             if m.State == 0x1000 and m.Protect in (0x04, 0x40):
                 for off in range(0, m.RegionSize, 1 << 25):
                     b = self.raw(m.BaseAddress + off, min(1 << 25, m.RegionSize - off))
                     if b:
                         arr = np.frombuffer(b[:len(b) // 8 * 8], np.uint64)
-                        found.update(int(x) for x in arr[np.isin(arr, keys)])
+                        for i in np.where(np.isin(arr, keys))[0]:
+                            found.setdefault(int(arr[i]), []).append(m.BaseAddress + off + int(i) * 8 - gb)
             a = m.BaseAddress + m.RegionSize
             if progress: progress(min(1, (a - gb - lo) / (hi - lo)))
         return found

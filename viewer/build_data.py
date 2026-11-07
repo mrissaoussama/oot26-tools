@@ -8,6 +8,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WALL = re.compile(r'AirWall|Airwall')
 ZONE_LOGIC = [('Gimmick_AreaContact_FallDown_Item', None), ('Gimmick_AreaContact_FallDown', 'void'), ('ItemAbyss', 'void'),
               ('InvalidateRestartArea', 'norespawn'), ('Whirlpool', 'whirlpool')]
+ACTOR_KINDS = ('Enemy_', 'Npc_', 'Animal_', 'Item_', 'Obj_Rupee', 'Obj_Heart', 'Obj_FairySpirit')
+OBJ_KEEP = ('Obj_', 'DgnObj_', 'FldObj_', 'TBox_')
+OBJ_SKIP = ('Npc_', 'Enemy_', 'Animal_', 'Item_', 'Dm_', 'EftLoc', 'Area', 'DestinationAnchor', 'Event', 'Sound',
+            'Snd', 'BGM', 'Navi', 'StartPos', 'Dungeon', 'Camera', 'Env', 'Volume', 'Forbid', 'Drop', 'Horse', 'Player')
 NON_PLAYER = ('Enemy', 'Horse', 'Animal', 'Cucco', 'Npc', 'Camera', 'Sight', 'Lure', 'Bomb', 'Hookshot', 'RollingRock',
               'Dodongo', 'Poe', 'Gohma', 'HitTarget', 'ObjectAndSmall', 'CrawlHole', 'HidingHole')
 
@@ -38,6 +42,17 @@ def actor_shapes(name):
             res = [Byml(v).root or {} for k, v in files.items() if 'ShapeParam' in k]
     _shapes[name] = res
     return res
+
+
+def main_box(name):
+    """AABB (min, max) of an object's main collision shape, from the shape's AutoCalc block."""
+    best = None
+    for s in actor_shapes(name):
+        a = s.get('AutoCalc')
+        if not a or not any(isinstance(v, list) and v for k, v in s.items() if k != 'AutoCalc'): continue
+        if best is None or a.get('Volume', 0) > best.get('Volume', 0): best = a
+    if not best: return None
+    return [[best['Min'][k] for k in 'XYZ'], [best['Max'][k] for k in 'XYZ']]
 
 
 def rot_matrix(r):
@@ -88,7 +103,7 @@ def place(polys, a):
 
 
 def build(progress=print):
-    out = []
+    out, live_actors = [], {}
     files = [(dp, f) for dp, _, fs in os.walk(romfs.path('Banc')) for f in fs if f.endswith('.bcett.byml.zs')]
     for i, (dp, f) in enumerate(files):
         progress('Building collision data: %d/%d %s' % (i + 1, len(files), f))
@@ -96,9 +111,19 @@ def build(progress=print):
         if not isinstance(root, dict): continue
         scene = f.replace('.bcett.byml.zs', '')
         actors = {a['Hash']: a for a in root.get('Actors', [])}
+        for h, a in actors.items():
+            if a.get('Gyaml', '').startswith(ACTOR_KINDS): live_actors[str(h)] = a['Gyaml']
         for a in actors.values():
             name = a.get('Gyaml', '')
-            if not WALL.search(name): continue
+            if not WALL.search(name):
+                if a.get('Bakeable') or not name.startswith(OBJ_KEEP) or name.startswith(OBJ_SKIP): continue
+                bb = main_box(name)
+                if bb and np.prod(np.subtract(bb[1], bb[0])) > 1e-4:
+                    lo, hi = np.array(bb[0]), np.array(bb[1])
+                    c, h = (lo + hi) / 2, (hi - lo) / 2
+                    polys = box({'HalfExtents': dict(zip('XYZ', h)), 'Center': dict(zip('XYZ', c))})
+                    out.append({'scene': scene, 'name': name, 'hash': a['Hash'], 'kind': 'object', 'polys': place(polys, a)})
+                continue
             polys = []
             for s in actor_shapes(name):
                 for b in s.get('Box', []): polys += box(b)
@@ -122,9 +147,10 @@ def build(progress=print):
                 out.append({'scene': scene, 'name': re.search(r'Module/([^/]+)/', logic).group(1), 'hash': a['Hash'],
                             'kind': kind, 'polys': polys})
     json.dump(out, open(os.path.join(HERE, 'geom.json'), 'w'))
+    json.dump(live_actors, open(os.path.join(HERE, 'actors.json'), 'w'))
     return out
 
 
 if __name__ == '__main__':
     if not romfs.load_config(): raise SystemExit('Set the romfs path first (run the viewer once).')
-    print(len(build()), 'objects')
+    print(len(build(lambda m: None)), 'objects')

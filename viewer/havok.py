@@ -97,15 +97,22 @@ def tile_origin(b, key, tiles):
     return np.array([(key[0] - nx / 2) * TILE, 0, (key[1] - nz / 2) * TILE], np.float32)
 
 
-def load_tile(path, key, tiles):
-    """Terrain mesh (tile-local) plus baked objects (compound shapes, world space)."""
+NOT_SOLID = re.compile(r'AirWall|Airwall|Area|Anchor|Camera|Sensor')
+
+
+def load_tile(path, key, tiles, names=None):
+    """Terrain mesh (tile-local) plus baked objects (compound shapes, world space).
+    names: placement hash -> actor name; baked areas and air walls are left out."""
     b = romfs.dec(open(path, 'rb').read())
+    skip = None
+    if names:
+        skip = {i for i, h in instance_actors(b).items() if NOT_SOLID.search(names.get(h, ''))}
     out = []
     tris = file_meshes(b)
     if len(tris):
         ok = np.all((tris > -2) & (tris < TILE + 2), axis=(1, 2))
         out.append(tris[ok] + tile_origin(b, key, tiles))
-    comp = file_compounds(b)
+    comp = file_compounds(b, skip)
     if len(comp):
         out.append(comp[np.all(np.isfinite(comp) & (np.abs(comp) < 1e5), axis=(1, 2))])
     return np.concatenate(out) if out else np.zeros((0, 3, 3), np.float32)
@@ -227,34 +234,51 @@ def _shape(t, off, depth=0):
 
 
 
-def _compound(t, off, depth=0):
+def _compound(t, off, depth=0, skip=None, base=0):
+    """skip: set of top-level instance indices (counted from base) to leave out."""
     inst = None
     for f in range(0, 0x100, 4):
         if t.D + off + f + 8 > len(t.b): break
         tgt, n = t.rel(off + f)
         k = t.items.get(tgt)
         if k and k[0] == 'hkFreeListArrayElement': inst = (tgt, k[1]); break
-    if not inst: return np.zeros((0, 3, 3), np.float32)
+    if not inst: return np.zeros((0, 3, 3), np.float32), 0
     out, cache = [], {}
     for i in range(inst[1]):
+        if skip and base + i in skip: continue
         o = inst[0] + i * 64
         sp, _ = t.rel(o + 48)
         if sp not in t.items: continue
-        if sp not in cache: cache[sp] = _shape(t, sp, depth)
+        if sp not in cache:
+            r = _shape(t, sp, depth)
+            cache[sp] = r[0] if isinstance(r, tuple) else r
         tris = cache[sp]
         if not len(tris): continue
         q = t.f32(o, 4); tr = t.f32(o + 16, 3); sc = t.f32(o + 32, 3)
         if not np.all(np.isfinite(sc)) or not np.any(sc): sc = np.ones(3, np.float32)
         out.append((tris * sc) @ _quat(q).T + tr)
-    return np.concatenate(out) if out else np.zeros((0, 3, 3), np.float32)
+    return np.concatenate(out) if out else np.zeros((0, 3, 3), np.float32), inst[1]
 
 
-def file_compounds(b):
-    res = []
+def instance_actors(b):
+    """Baked instance index -> placement hash, from the table in the Phive header."""
+    hdr = struct.unpack_from('<4I', b, 0x10)
+    out = {}
+    for o in range(hdr[0], hdr[1] - 0x1F, 0x20):
+        first, last, h = struct.unpack_from('<iiQ', b, o)
+        if first < 0: continue
+        for i in range(first, last + 1): out[i] = h
+    return out
+
+
+def file_compounds(b, skip=None):
+    res, base = [], 0
     for o, sz in tag_sections(b):
         try:
             t = Tag(b, o, sz)
         except Exception:
             continue
-        if t.root == 'hknpCompoundShape': res.append(_compound(t, 0))
+        if t.root == 'hknpCompoundShape':
+            tris, n = _compound(t, 0, skip=skip, base=base)
+            res.append(tris); base += n
     return np.concatenate(res) if res else np.zeros((0, 3, 3), np.float32)
