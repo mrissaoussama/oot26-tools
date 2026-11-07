@@ -18,6 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 KINDS = [  # key, label, rgb, alpha, shown by default
     ('terrain', 'Terrain / visible collision', (150, 160, 150), 255, True),
     ('player', 'Invisible walls (block Link)', (255, 50, 50), 90, True),
+    ('airwall', 'Air-wall surfaces in terrain (many only stop the camera / NPCs)', (255, 140, 140), 45, False),
     ('climb', 'Climb-only walls', (255, 220, 0), 90, True),
     ('push', 'Push walls (doors etc.)', (60, 140, 255), 80, False),
     ('other', 'Enemy / horse / camera walls', (150, 150, 150), 60, False),
@@ -30,6 +31,7 @@ KINDS = [  # key, label, rgb, alpha, shown by default
     ('whirlpool', 'Whirlpools', (30, 60, 200), 70, False),
 ]
 KCOL = {k: (c, a) for k, _, c, a, _ in KINDS}
+ZONE_KINDS = ('loading', 'void', 'safepath', 'norespawn', 'whirlpool')
 MAT_NAMES = ['Undefined', 'Soil', 'Grass', 'Sand', 'HeavySand', 'Snow', 'HeavySnow', 'Stone', 'StoneSlip', 'StoneNoSlip',
              'Metal', 'MetalSlip', 'MetalNoSlip', 'WireNet', 'Wood', 'Ice', 'Cloth', 'Glass', 'Bone', 'Rope', 'Character',
              'Ragdoll', 'Meat', 'Vegetable', 'Bomb', 'MagicBall', 'Barrier', 'AirWall', 'Water', 'HotWater', 'IceWater',
@@ -523,13 +525,13 @@ class GLView(QOpenGLWidget):
             m = (np.abs(c[:, 0] - lx) < rng) & (np.abs(c[:, 2] - lz) < rng) & (ks == k)
             if app.only_zone.isChecked() and app.active: m &= np.isin(ss, zone_ids)
             # Objects are actors: draw only existing ones. Walls can be baked, so only drop those absent from memory.
-            if live: m &= np.isin(hs, app.live_keys if k == obj else app.found_keys)
+            if live and k not in ZONE_KINDS: m &= np.isin(hs, app.live_keys if k == obj else app.found_keys)
             if k == obj and app.obj_live_keys is not None: m &= ~np.isin(hs, app.obj_live_keys)
             m &= ~np.isin(hs, app.hidden_keys)
             return m
         trans, lines, opaque, picks = [], [], [], []
         for i, k in enumerate(d.kind_names):
-            if k in ('terrain', 'conditional') or not show[k]: continue
+            if k in ('terrain', 'conditional', 'airwall') or not show[k]: continue
             m = sel(d.wc, d.wk, d.ws, i, d.wh)
             if height: m &= near_link(d.wt)
             if m.any():
@@ -560,7 +562,7 @@ class GLView(QOpenGLWidget):
                     baked = solid & (h != 0)
                     if baked.any(): picks.append((t[baked], h[baked]))
                 if show['conditional'] and cond.any(): trans.append(vertices(t[cond], *KCOL['conditional']))
-                if show['player'] and airwall.any(): trans.append(vertices(t[airwall], *KCOL['player']))
+                if show['airwall'] and airwall.any(): trans.append(vertices(t[airwall], *KCOL['airwall']))
             self.floor = floor
         self.picks = picks
         cat = lambda L: np.concatenate(L) if L else np.zeros((0, 10), np.float32)
@@ -736,6 +738,7 @@ class App(QWidget):
         self.target = None
         self.selection = set()
         self.saved_bodies, self.path_body = {}, None
+        self.travel_armed = None
         try:
             self.hidden_keys = np.array(json.load(open(os.path.join(HERE, 'hidden.json'))), np.uint64)
         except Exception:
@@ -793,6 +796,7 @@ class App(QWidget):
         b = QPushButton('Restore zones'); b.clicked.connect(self.restore_bodies); row.addWidget(b)
         sl.addLayout(row)
         self.on_path = QCheckBox('Keep Link on the safe path (no send-back)'); self.on_path.toggled.connect(self.toggle_path); sl.addWidget(self.on_path)
+        self.travel_btn = QPushButton('Travel to another map...'); self.travel_btn.clicked.connect(self.travel_menu); sl.addWidget(self.travel_btn)
         b = QPushButton('Set romfs folder (for terrain)'); b.clicked.connect(self.pick_romfs); sl.addWidget(b)
         self.range = QSlider(Qt.Horizontal); self.range.setRange(15, 300); self.range.setValue(120)
         self.range_lbl = QLabel('Draw distance: 120 units'); sl.addWidget(self.range_lbl); sl.addWidget(self.range)
@@ -890,6 +894,56 @@ class App(QWidget):
                 rows.append(('%s [%s]  %.0f %.0f %.0f' % (name, kind, *c), tuple(map(float, c)), h, QColor(*KCOL[kind][0]) if kind in KCOL else QColor('white')))
         for label, p, h, col in rows[:2000]:
             it = QListWidgetItem(label); it.setData(Qt.UserRole, (p, h)); it.setForeground(col); self.results.addItem(it)
+
+    def travel_menu(self):
+        try:
+            table = json.load(open(os.path.join(HERE, 'travel.json')))
+        except Exception:
+            self.zone_msg = 'travel.json missing: rebuild the data'; return
+        menu = QMenu(self)
+        areas = {}
+        for banc in sorted(table): areas.setdefault(re.sub(r'_(Child|Adult)(_Alternative)?$', '', banc), []).append(banc)
+        for area, bancs in areas.items():
+            sub = menu.addMenu(area)
+            for banc in bancs:
+                tgt = sub.addMenu(banc) if len(bancs) > 1 else sub
+                for pos, event, label in table[banc]:
+                    tgt.addAction('%s  (%s)' % (pos, label), lambda b=banc, p=pos, e=event: self.travel(b, p, e))
+        if self.travel_armed: menu.addAction('Cancel pending travel', self.cancel_travel)
+        menu.exec(self.travel_btn.mapToGlobal(self.travel_btn.rect().bottomLeft()))
+
+    def travel(self, banc, pos, event):
+        """Redirects the next map change: the game's reserved Next* GameData values are replaced the moment an exit writes them."""
+        if not self.game.seq_slots():
+            self.zone_msg = 'travel: could not find the game data'; return
+        self.travel_armed = (banc, pos, event)
+        self.zone_msg = 'travel to %s / %s armed: Link is being put into the nearest exit (or walk into any exit)' % (banc, pos)
+        threading.Thread(target=self._travel_watch, args=(self.travel_armed,), daemon=True).start()
+        s = self.state
+        act = self.active or ()
+        zones = [(c, n) for c, n, sc, h in self.data.loading_zones if not act or sc in act]
+        if s and zones:
+            c, n = min(zones, key=lambda z: (z[0][0] - s['x']) ** 2 + (z[0][2] - s['z']) ** 2)
+            self.teleport((float(c[0]), float(c[1]) - 0.5, float(c[2])))
+
+    def _travel_watch(self, req):
+        banc, pos, event = req
+        g = self.game
+        g.seq_put('banc', '')
+        t = time.time()
+        while time.time() - t < 300 and self.travel_armed == req:
+            nb = g.seq_get('banc')
+            if nb:
+                g.seq_put('banc', banc); g.seq_put('pos', pos); g.seq_put('starter', pos); g.seq_put('event', event)
+                self.zone_msg = 'travelling to %s / %s' % (banc, pos)
+                break
+            time.sleep(0.005)
+        else:
+            if self.travel_armed == req: self.zone_msg = 'travel timed out (no exit was taken)'
+        if self.travel_armed == req: self.travel_armed = None
+
+    def cancel_travel(self):
+        self.travel_armed = None; self.zone_msg = 'travel cancelled'
 
     def zone_bodies(self, kinds):
         """[(hash, body address)] for live area triggers of the given kinds in the loaded zone."""

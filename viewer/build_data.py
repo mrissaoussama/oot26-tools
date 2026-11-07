@@ -216,26 +216,38 @@ def build(progress=print):
                 out.append({'scene': scene, 'name': label or re.search(r'Module/([^/]+)/', logic).group(1), 'hash': a['Hash'],
                             'kind': kind, 'polys': polys})
     json.dump(out, open(os.path.join(HERE, 'geom.json'), 'w'))
-    json.dump(entrances(), open(os.path.join(HERE, 'entrances.json'), 'w'))
+    json.dump(travel_table(), open(os.path.join(HERE, 'travel.json'), 'w'))
     json.dump({'actors': live_actors, 'boxes': boxes, 'shapes': {k: v for k, v in shapes.items() if v}},
               open(os.path.join(HERE, 'actors.json'), 'w'))
     return out
 
 
-def entrances():
-    """Every loading zone: [source scene, child target, adult target, spawn point, arrival event, position]."""
-    out = []
+def travel_table():
+    """{map: [[spawn point, arrival event, label]]} from every StartPos in the game plus the exits that lead to it."""
     root = romfs.path('Banc')
+    spawns, events = {}, {}
     for area in sorted(os.listdir(root)):
         folder = os.path.join(root, area)
         if not os.path.isdir(folder): continue
         for f in sorted(os.listdir(folder)):
             if not f.endswith('.bcett.byml.zs'): continue
+            scene = f.split('.')[0]
+            banc = re.sub(r'_(Static|Dynamic)$', '', scene)
             for a in Byml(romfs.read('Banc', area, f)).root.get('Actors', []):
                 d = a.get('Dynamic') or {}
-                if d.get('NextStartPosName') or d.get('NextBancParamNameChild'):
-                    out.append([f.split('.')[0], d.get('NextBancParamNameChild'), d.get('NextBancParamNameAdult'),
-                                d.get('NextStartPosName'), d.get('NextEventName'), a.get('Translate', [0, 0, 0])])
+                if a.get('Gyaml') == 'StartPos' and a.get('Name') and a['Name'] != 'EntrancePos':
+                    spawns.setdefault(banc, {}).setdefault(a['Name'], None)
+                pos = d.get('NextStartPosName')
+                for target in {d.get('NextBancParamNameChild'), d.get('NextBancParamNameAdult')} - {None}:
+                    if pos: events.setdefault((target, pos), (d.get('NextEventName') or 'Dm_SY_BancChangeArrive', scene))
+    for target, pos in events: spawns.setdefault(target, {}).setdefault(pos, None)
+    out = {}
+    for banc, names in sorted(spawns.items()):
+        rows = []
+        for n in sorted(names):
+            ev, src = events.get((banc, n), ('Dm_SY_BancChangeArrive', None))
+            rows.append([n, ev, ('from ' + re.sub(r'_(Static|Dynamic)$', '', src)) if src else 'other spawn point'])
+        out[banc] = rows
     return out
 
 

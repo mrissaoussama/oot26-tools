@@ -24,6 +24,20 @@ def ce(lua):
             time.sleep(0.1)
 
 
+def murmur3(data, seed=0):
+    c1, c2, h, n = 0xcc9e2d51, 0x1b873593, seed, len(data)
+    for i in range(0, n // 4 * 4, 4):
+        k = (struct.unpack_from('<I', data, i)[0] * c1) & 0xffffffff
+        k = (((k << 15) | (k >> 17)) * c2) & 0xffffffff
+        h ^= k; h = ((((h << 13) | (h >> 19)) & 0xffffffff) * 5 + 0xe6546b64) & 0xffffffff
+    k = 0
+    for i, b in enumerate(data[n // 4 * 4:]): k |= b << (8 * i)
+    if n % 4:
+        k = (k * c1) & 0xffffffff; k = (((k << 15) | (k >> 17)) * c2) & 0xffffffff; h ^= k
+    h ^= n; h ^= h >> 16; h = (h * 0x85ebca6b) & 0xffffffff; h ^= h >> 13; h = (h * 0xc2b2ae35) & 0xffffffff
+    return h ^ (h >> 16)
+
+
 class MBI(ctypes.Structure):
     _fields_ = [('BaseAddress', ctypes.c_uint64), ('AllocationBase', ctypes.c_uint64), ('AllocationProtect', wt.DWORD),
                 ('PartitionId', wt.WORD), ('RegionSize', ctypes.c_uint64), ('State', wt.DWORD), ('Protect', wt.DWORD), ('Type', wt.DWORD)]
@@ -204,6 +218,49 @@ class Game:
             f[k] += d
         f[27] += dz
         self.write(body, struct.pack('<32f', *f))
+
+    SEQ_FIELDS = {'Sequence_CurrentBanc': 'cur', 'Sequence_ReservedBootEventName': 'event',
+                  'Sequence_ReservedEventStarterName': 'starter', 'Sequence_ReservedNextBanc': 'banc',
+                  'Sequence_ReservedNextStartPosName': 'pos'}
+
+    def seq_slots(self):
+        """Addresses of the GameData String64 values that hold the reserved map change (cached).
+        Each String64 entry is three sead::FixedSafeString<64> (0x68/0x50/0x50 apart); the second is the live value."""
+        gb = self.addr['gb']
+        c = getattr(self, '_seq', None)
+        if c and (self.raw(gb + c['cur'], 4) or b'\0')[:1] not in (b'\0',): return c
+        want = {murmur3(n.encode()): k for n, k in self.SEQ_FIELDS.items()}
+        keys = np.array(list(want), np.uint32)
+        idx, table, a, m = {}, None, gb + 0x2180000000, MBI()
+        while a < gb + 0x2190000000 and len(idx) < len(want) and k32.VirtualQueryEx(self.h, a, ctypes.byref(m), ctypes.sizeof(m)):
+            if m.State == 0x1000 and m.Protect in (0x04, 0x40):
+                buf = self.raw(m.BaseAddress, m.RegionSize)
+                if buf:
+                    u = np.frombuffer(buf[:len(buf) // 4 * 4], np.uint32)
+                    for j in np.where(np.isin(u[:-1], keys))[0]:
+                        if u[j + 1] < 0x400 and (j * 4) % 8 == 0:
+                            idx.setdefault(want[int(u[j])], int(u[j + 1])); table = (m.BaseAddress, m.RegionSize)
+            a = m.BaseAddress + m.RegionSize
+        if len(idx) < len(want) or table is None: return None
+        base, size = table
+        buf = self.raw(base, size) or b''
+        objs = [base + o for o in range(0, len(buf) - 16, 4) if struct.unpack_from('<QI', buf, o) == (base + o + 0xC - gb, 0x40)]
+        for start in range(len(objs)):
+            if start + 3 * max(idx.values()) + 2 >= len(objs): break
+            cur = objs[start + 3 * idx['cur'] + 1]
+            if objs[start + 1] - objs[start] == 0x50 and (self.raw(cur + 0xC, 1) or b'\0') != b'\0':
+                if all(objs[start + 3 * k + 1] - objs[start + 3 * k] == 0x50 for k in idx.values()):
+                    self._seq = {k: objs[start + 3 * i + 1] + 0xC - gb for k, i in idx.items()}
+                    return self._seq
+        return None
+
+    def seq_get(self, k):
+        c = self.seq_slots()
+        return c and self.raw(self.addr['gb'] + c[k], 0x40).split(b'\0')[0].decode('latin1')
+
+    def seq_put(self, k, text):
+        c = self.seq_slots()
+        if c: self.write(c[k], text.encode()[:0x3F].ljust(0x40, b'\0'))
 
     def write_u32(self, guest, value):
         if not self.write(guest, struct.pack('<I', value & 0xFFFFFFFF)):
