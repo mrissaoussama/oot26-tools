@@ -157,6 +157,22 @@ class Game:
         t = self.read(self.addr['gb'] + model + 0xA0, '<12f')
         return (t[3], t[7], t[11]) if t else None
 
+    def teleport(self, x, y, z):
+        """Moves Link through Link tools, asking it to re-find his position first if it lost it."""
+        if not self.addr.get('linkpos'):
+            ce('ltFindPos() return 1')
+            self.last = 0; self.refresh()
+            if not self.addr.get('linkpos'): return False
+        b = self.addr['linkpos']
+        cur = self.read(b, '<3d')
+        if not cur: return False
+        d = (x - cur[0], y + 0.585 - cur[1], z - cur[2])
+        # Link tools keeps every copy of the record in LINKPOS_ALL; shift them too, then the driving one.
+        ce('for _,a in ipairs(LINKPOS_ALL or {}) do if a ~= %d then writeDouble(a, readDouble(a)+%r) writeDouble(a+8, readDouble(a+8)+%r) '
+           'writeDouble(a+16, readDouble(a+16)+%r) end end return 1' % (b, *d))
+        k32.WriteProcessMemory(self.h, b, struct.pack('<3d', x, y + 0.585, z), 24, None)
+        return True
+
     def write_u32(self, guest, value):
         if not self.write(guest, struct.pack('<I', value & 0xFFFFFFFF)):
             ce('writeInteger(%d, %d) return 1' % (self.addr['gb'] + guest, value))

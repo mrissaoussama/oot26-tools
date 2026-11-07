@@ -693,6 +693,7 @@ class App(QWidget):
         self.search = QLineEdit(); self.search.setPlaceholderText('Search this map (any name)...'); sl.addWidget(self.search)
         self.results = QListWidget(); self.results.setFixedHeight(150); sl.addWidget(self.results)
         self.search.textChanged.connect(self.do_search)
+        self.search_timer = QTimer(self); self.search_timer.setSingleShot(True); self.search_timer.timeout.connect(lambda: self.do_search(self.search.text()))
         self.results.itemClicked.connect(lambda it: self.go_to(*it.data(Qt.UserRole)))
         row = QHBoxLayout()
         b = QPushButton('Teleport Link there'); b.clicked.connect(self.teleport_selected); row.addWidget(b)
@@ -781,10 +782,9 @@ class App(QWidget):
         """Everything in the current map whose name matches, ignoring the view filters."""
         self.results.clear()
         t = text.strip().lower()
-        if len(t) < 2: return
         rows = []
         for name, acts in self.live_named.items():
-            if t in name.lower():
+            if not name.startswith(SKIP_ACTORS) and name not in SYSTEM_ACTORS and t in name.lower():
                 for a in acts[:50]:
                     p = self.game.actor_pos(a)
                     if p and sum(map(abs, p)) > 0.01:
@@ -794,7 +794,7 @@ class App(QWidget):
         for name, kind, scene, c, h in self.data.items:
             if (not act or scene in act) and (t in name.lower() or t in kind):
                 rows.append(('%s [%s]  %.0f %.0f %.0f' % (name, kind, *c), tuple(map(float, c)), h))
-        for label, p, h in rows[:400]:
+        for label, p, h in rows[:2000]:
             it = QListWidgetItem(label); it.setData(Qt.UserRole, (p, h)); self.results.addItem(it)
 
     def go_to(self, p, h):
@@ -804,8 +804,12 @@ class App(QWidget):
         self.view.free = [float(p[0]), float(p[1]) + 8, float(p[2]) + 12, 0.0, -0.55]
 
     def teleport(self, p):
-        game.ce('linkTeleport(%f, %f, %f) return 1' % (p[0], p[1] + 0.5, p[2]))
-        self.zone_msg = 'teleported Link to %.1f %.1f %.1f' % tuple(p[:3])
+        self.zone_msg = 'teleporting...'
+        threading.Thread(target=self._teleport, args=(tuple(p),), daemon=True).start()
+
+    def _teleport(self, p):
+        ok = self.game.teleport(p[0], p[1] + 0.5, p[2])
+        self.zone_msg = ('teleported Link to %.1f %.1f %.1f (move Link once if he hangs in the air)' % tuple(p[:3])) if ok else "teleport failed: Link's position not found"
 
     def teleport_selected(self):
         if self.target is not None: self.teleport(self.target)
@@ -1053,6 +1057,9 @@ class App(QWidget):
                 self.obj_live_keys = np.array(sorted(h for h, *_ in dyn if h in self.data.obj_info), np.uint64)
                 self.actor_version += 1
         if self.pins: self.keep_pins()
+        if getattr(self, '_search_ver', None) != (self.live_version, tuple(sorted(self.active or ()))):
+            self._search_ver = (self.live_version, tuple(sorted(self.active or ())))
+            self.do_search(self.search.text())
         self.view.step_free()
         self.view.update()
 
