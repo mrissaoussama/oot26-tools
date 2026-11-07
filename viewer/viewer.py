@@ -406,6 +406,7 @@ class GLView(QOpenGLWidget):
         menu.addAction('Point camera here', lambda: self.look_at(pt))
         menu.addAction('Fly camera here', lambda: self.fly_to(pt))
         menu.addAction('Copy coords of this point', lambda: self.app.copy_coords(pt))
+        menu.addAction('Remove invisible-wall faces around this point (10 units)', lambda: self.app.remove_faces_near(pt))
         if h:
             menu.addSeparator()
             name = self.app.name_of(h) or 'object %x' % h
@@ -427,10 +428,14 @@ class GLView(QOpenGLWidget):
                     menu.addAction('Re-enable collision in game', lambda: self.app.set_collision(h, True))
                 else:
                     menu.addAction('Disable collision in game', lambda: self.app.set_collision(h, False))
+                if h in self.app.collapsed:
+                    menu.addAction('Restore its invisible-wall faces', lambda: self.app.restore_faces(h))
+                else:
+                    menu.addAction('Remove only its invisible-wall faces (keep the rest)', lambda: self.app.remove_airwall_faces(h))
         menu.addSeparator()
         if self.app.selection: self.app.group_menu(menu)
-        if self.app.disabled:
-            menu.addAction('Re-enable everything I disabled (%d)' % len(self.app.disabled), self.app.restore_all)
+        if self.app.disabled or self.app.collapsed:
+            menu.addAction('Re-enable everything I disabled (%d)' % (len(self.app.disabled) + len(self.app.collapsed)), self.app.restore_all)
         if self.app.moved:
             menu.addAction('Put back everything I moved (%d)' % len(self.app.moved), self.app.put_back_all)
         if self.app.gizmo:
@@ -739,6 +744,7 @@ class App(QWidget):
         self.selection = set()
         self.saved_bodies, self.path_body = {}, None
         self.travel_armed = None
+        self.collapsed = {}
         try:
             self.hidden_keys = np.array(json.load(open(os.path.join(HERE, 'hidden.json'))), np.uint64)
         except Exception:
@@ -1057,6 +1063,7 @@ class App(QWidget):
     def restore_one(self, h):
         if h in self.moved: self.put_back(h)
         if h in self.disabled: self.set_collision(h, True)
+        if h in self.collapsed: self.restore_faces(h)
 
     def go_to(self, p, h):
         self.selected = h
@@ -1198,7 +1205,54 @@ class App(QWidget):
             if (cur and np.linalg.norm(np.array(cur) - pos) > 0.02) or (mcur and mpos and np.linalg.norm(np.array(mcur) - mpos) > 0.02):
                 self.game.move(a, m, pos, mpos)
 
+    def remove_airwall_faces(self, h):
+        """Collapses the AirWall-material quads of a baked piece in the in-place loaded collision file."""
+        done = []
+        gbase = self.game.addr['gb']
+        for path in self.baked_tiles(h):
+            raw, recs, owners = self.data.tile_info[path]
+            base = self.loaded_base(path)
+            if base is None: continue
+            for off in havok.material_prims(raw, set(owners[h])):
+                cur = self.game.raw(gbase + base + off, 4)
+                if cur != raw[off:off + 4]: continue
+                done.append((base + off, cur))
+                self.game.write(base + off, bytes([cur[0]]) * 4)
+        if done:
+            self.collapsed[h] = done
+            self.zone_msg = 'removed %d invisible-wall faces of %s - move Link to wake physics' % (len(done), self.name_of(h) or hex(h))
+        else:
+            self.zone_msg = 'no invisible-wall faces found in that piece'
+
+    def remove_faces_near(self, p, radius=10.0):
+        """Collapses AirWall-material quads of the plain terrain mesh near p (all loaded tiles of the zone)."""
+        done = []
+        gbase = self.game.addr['gb']
+        for sc, tiles in self.data.tiles.items():
+            if self.active and sc not in self.active: continue
+            for key, path in tiles.items():
+                if path not in self.data.tile_info: continue
+                raw = self.data.tile_info[path][0]
+                base = self.loaded_base(path)
+                if base is None: continue
+                for off in havok.terrain_material_prims(raw, key, tiles, p, radius):
+                    cur = self.game.raw(gbase + base + off, 4)
+                    if cur != raw[off:off + 4]: continue
+                    done.append((base + off, cur))
+                    self.game.write(base + off, bytes([cur[0]]) * 4)
+        k = ('faces', tuple(round(x, 1) for x in p))
+        if done:
+            self.collapsed[k] = done
+            self.zone_msg = 'removed %d terrain invisible-wall faces near %.0f %.0f %.0f - move Link to wake physics' % (len(done), *p)
+        else:
+            self.zone_msg = 'no terrain invisible-wall faces within %d units' % radius
+
+    def restore_faces(self, h):
+        for addr, orig in self.collapsed.pop(h, []): self.game.write(addr, orig)
+        self.zone_msg = 'faces restored'
+
     def restore_all(self):
+        for h in list(self.collapsed): self.restore_faces(h)
         for h in list(self.disabled): self.set_collision(h, True)
 
     def hide(self, h):

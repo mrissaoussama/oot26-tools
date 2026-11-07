@@ -358,3 +358,71 @@ def instance_records(b):
         for i in range(inst[1]): out[base + i] = t.D + inst[0] + i * 64
         base += inst[1]
     return out
+
+
+def material_prims(b, instances, material=27):
+    """File offsets of the 4-byte mesh primitives (quads) whose material is `material` (27 = AirWall),
+    inside the given top-level baked instances. Pointing all four indices at one vertex removes the face
+    without growing any bounding box."""
+    table, starts = materials(b)
+    out, base = [], 0
+    for o, sz in tag_sections(b):
+        try:
+            t = Tag(b, o, sz)
+        except Exception:
+            continue
+        if t.root != 'hknpCompoundShape': continue
+        inst = next(((off, k[1]) for off, k in t.items.items() if k[0] == 'hkFreeListArrayElement'), None)
+        if not inst: continue
+        for i in range(inst[1]):
+            g = base + i
+            if g not in instances or g not in starts: continue
+            sp, _ = t.rel(inst[0] + i * 64 + 48)
+            if t.items.get(sp, (None,))[0] != 'hknpMeshShape': continue
+            first = starts[g][0]
+            so, sn = t.rel(sp + 0x88)
+            to, tn = t.rel(sp + 0x60)
+            tab = np.frombuffer(t.b, '<u4', tn * 2, t.D + to).reshape(-1, 2) if tn else np.zeros((0, 2), np.uint32)
+            for s in range(sn):
+                po, pn = t.rel(so + s * 0x40 + 8)
+                if not pn: continue
+                keys = (s << 8) | np.arange(pn)
+                tg = tab[np.clip(np.searchsorted(tab[:, 0], keys, 'right') - 1, 0, None), 1].astype(np.int64) if len(tab) else np.zeros(pn, np.int64)
+                idx = np.clip(first + tg, 0, len(table) - 1)
+                for k in np.where(table['m'][idx] == material)[0]:
+                    out.append(t.D + po + int(k) * 4)
+        base += inst[1]
+    return out
+
+
+def terrain_material_prims(b, key, tiles, center, radius, material=27):
+    """File offsets of the plain terrain mesh's quads with `material` whose centre lies within radius of center (world)."""
+    table, starts = materials(b)
+    mesh = [v for v in starts.values() if v[2] == 2]
+    first = max(mesh, key=lambda v: v[1])[0] if mesh else 0
+    origin = tile_origin(b, key, tiles)
+    c = np.asarray(center, np.float32)
+    out = []
+    for o, sz in tag_sections(b):
+        try:
+            t = Tag(b, o, sz)
+        except Exception:
+            continue
+        if t.root != 'hknpMeshShape': continue
+        so, sn = t.rel(0x88)
+        to, tn = t.rel(0x60)
+        tab = np.frombuffer(t.b, '<u4', tn * 2, t.D + to).reshape(-1, 2) if tn else np.zeros((0, 2), np.uint32)
+        for s in range(sn):
+            sec = so + s * 0x40
+            po, pn = t.rel(sec + 8); vo, _ = t.rel(sec + 16)
+            if not pn: continue
+            P = np.frombuffer(t.b, np.uint8, pn * 4, t.D + po).reshape(-1, 4).astype(np.int64)
+            V = np.frombuffer(t.b, '<u2', (int(P.max()) + 1) * 3, t.D + vo).reshape(-1, 3).astype(np.float32)
+            W = (np.array(struct.unpack_from('<3i', t.b, t.D + sec + 32), np.float32) + V) / 512.0 + origin
+            keys = (s << 8) | np.arange(pn)
+            tg = tab[np.clip(np.searchsorted(tab[:, 0], keys, 'right') - 1, 0, None), 1].astype(np.int64) if len(tab) else np.zeros(pn, np.int64)
+            mat = table['m'][np.clip(first + tg, 0, len(table) - 1)]
+            ctr = W[P].mean(1)
+            for k in np.where((mat == material) & (np.linalg.norm(ctr - c, axis=1) < radius))[0]:
+                out.append(t.D + po + int(k) * 4)
+    return out
