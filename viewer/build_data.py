@@ -235,8 +235,9 @@ def travel_table():
             banc = re.sub(r'_(Static|Dynamic)$', '', scene)
             for a in Byml(romfs.read('Banc', area, f)).root.get('Actors', []):
                 d = a.get('Dynamic') or {}
-                if a.get('Gyaml') == 'StartPos' and a.get('Name') and a['Name'] != 'EntrancePos':
-                    spawns.setdefault(banc, {}).setdefault(a['Name'], None)
+                if a.get('Gyaml') == 'StartPos':
+                    names = spawns.setdefault(banc, {})
+                    if a.get('Name') and a['Name'] != 'EntrancePos': names.setdefault(a['Name'], None)
                 pos = d.get('NextStartPosName')
                 for target in {d.get('NextBancParamNameChild'), d.get('NextBancParamNameAdult')} - {None}:
                     if pos: events.setdefault((target, pos), (d.get('NextEventName') or 'Dm_SY_BancChangeArrive', scene))
@@ -244,9 +245,9 @@ def travel_table():
     out = {}
     for banc, names in sorted(spawns.items()):
         rows = []
-        for n in sorted(names):
+        for n in sorted(names) or ['StartPos']:
             ev, src = events.get((banc, n), ('Dm_SY_BancChangeArrive', None))
-            rows.append([n, ev, ('from ' + re.sub(r'_(Static|Dynamic)$', '', src)) if src else 'other spawn point'])
+            rows.append([n, ev, ('from ' + re.sub(r'_(Static|Dynamic)$', '', src)) if src else 'other spawn point' if names else 'default spawn point'])
         out[banc] = rows
     return out
 
