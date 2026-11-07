@@ -1,4 +1,5 @@
 viewer/config.json
+viewer/hidden.json
 viewer/viewer_error.log
 __pycache__/
 *.zip

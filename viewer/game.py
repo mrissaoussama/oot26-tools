@@ -68,6 +68,13 @@ class Game:
         v = self.read(gb + p[0], '<Q')
         return p[0] if v and M <= v[0] < M + 0x6000000 else None
 
+    def actor_rot(self, actor):
+        """3x3 rotation (row-major at +0x328), or None if it does not look like a rotation."""
+        r = self.read(self.addr.get('gb') + actor + 0x328, '<9f')
+        if not r: return None
+        R = np.array(r, np.float32).reshape(3, 3)
+        return R if np.all(np.isfinite(R)) and abs(abs(np.linalg.det(R)) - 1) < 0.05 else None
+
     def actor_pos(self, actor):
         p = self.read(self.addr.get('gb') + actor + 0x31C, '<3f')
         return p if p and all(math.isfinite(v) and abs(v) < 1e5 for v in p) else None

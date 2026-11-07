@@ -101,22 +101,34 @@ NOT_SOLID = re.compile(r'AirWall|Airwall|Area|Anchor|Camera|Sensor')
 
 
 def load_tile(path, key, tiles, names=None):
-    """Terrain mesh (tile-local) plus baked objects (world space).
-    Returns (triangles, placement hash per triangle; 0 = plain terrain). Baked areas and air walls are left out."""
+    """Terrain mesh plus baked objects, world space.
+    Returns (triangles, placement hash, material, submaterial, shape-tag flags) per triangle; hash 0 = plain terrain.
+    Baked areas and air walls are left out."""
     b = romfs.dec(open(path, 'rb').read())
     owner = instance_actors(b)
+    table, starts = materials(b)
     skip = {i for i, h in owner.items() if NOT_SOLID.search(names.get(h, ''))} if names else None
-    tris_out, hash_out = [], []
-    tris = file_meshes(b)
+    tris_out, hash_out, mat_out = [], [], []
+    tris, tags = terrain_mesh(b)
     if len(tris):
         ok = np.all((tris > -2) & (tris < TILE + 2), axis=(1, 2))
+        mesh = [v for v in starts.values() if v[2] == 2]
+        first = max(mesh, key=lambda v: v[1])[0] if mesh else 0
         tris_out.append(tris[ok] + tile_origin(b, key, tiles)); hash_out.append(np.zeros(int(ok.sum()), np.uint64))
-    comp, idx = file_compounds(b, skip)
+        mat_out.append(first + tags[ok])
+    comp, idx, tags = file_compounds(b, skip)
     if len(comp):
         ok = np.all(np.isfinite(comp) & (np.abs(comp) < 1e5), axis=(1, 2))
         tris_out.append(comp[ok]); hash_out.append(np.array([owner.get(int(i), 0) for i in idx[ok]], np.uint64))
-    if not tris_out: return np.zeros((0, 3, 3), np.float32), np.zeros(0, np.uint64)
-    return np.concatenate(tris_out), np.concatenate(hash_out)
+        first = np.array([starts.get(int(i), (0, 1, 0))[0] for i in idx[ok]], np.int64)
+        mat_out.append(first + tags[ok])
+    if not tris_out or not len(table):
+        z = np.zeros(sum(len(t) for t in tris_out), np.uint64)
+        tri = np.concatenate(tris_out) if tris_out else np.zeros((0, 3, 3), np.float32)
+        return tri, (np.concatenate(hash_out) if hash_out else z), z.astype(np.uint8), z.astype(np.uint8), z
+    mt = table[np.clip(np.concatenate(mat_out), 0, len(table) - 1)]
+    return (np.concatenate(tris_out), np.concatenate(hash_out),
+            mt['m'].astype(np.uint8), mt['s'].astype(np.uint8), mt['f'].astype(np.uint64))
 
 
 def _varuint(b, p):
@@ -209,8 +221,12 @@ def _capsule(t, off, n=12):
 
 
 def _mesh_obj(t, off):
+    """Mesh shape at data offset off -> (triangles, shape tag per triangle).
+    Tags come from shapeTagTable (+0x60): sorted (key, tag) runs, key = section << 8 | primitive."""
     so, sn = t.rel(off + 0x88)
-    out = []
+    to, tn = t.rel(off + 0x60)
+    tab = np.frombuffer(t.b, '<u4', tn * 2, t.D + to).reshape(-1, 2) if tn else np.zeros((0, 2), np.uint32)
+    out, tags = [], []
     for i in range(sn):
         o = so + i * 0x40
         po, pn = t.rel(o + 8); vo, _ = t.rel(o + 16)
@@ -219,19 +235,28 @@ def _mesh_obj(t, off):
         nv = int(P.max()) + 1
         V = np.frombuffer(t.b, '<u2', nv * 3, t.D + vo).reshape(-1, 3).astype(np.float32)
         W = (np.array(struct.unpack_from('<3i', t.b, t.D + o + 32), np.float32) + V) / 512.0
-        out.append(W[P[:, [0, 1, 2]]])
+        keys = (i << 8) | np.arange(pn)
+        if len(tab):
+            tg = tab[np.clip(np.searchsorted(tab[:, 0], keys, 'right') - 1, 0, None), 1].astype(np.int64)
+        else:
+            tg = np.zeros(pn, np.int64)
+        out.append(W[P[:, [0, 1, 2]]]); tags.append(tg)
         quad = P[:, 2] != P[:, 3]
-        if quad.any(): out.append(W[P[quad][:, [0, 2, 3]]])
-    return np.concatenate(out) if out else np.zeros((0, 3, 3), np.float32)
+        if quad.any(): out.append(W[P[quad][:, [0, 2, 3]]]); tags.append(tg[quad])
+    if not out: return np.zeros((0, 3, 3), np.float32), np.zeros(0, np.int64)
+    return np.concatenate(out), np.concatenate(tags)
 
 
 def _shape(t, off, depth=0):
     kind = t.items.get(off, (None,))[0]
-    if kind in ('hknpBoxShape', 'hknpConvexShape', 'hknpConvexPolytopeShape'): return _convex(t, off)
-    if kind == 'hknpCapsuleShape': return _capsule(t, off)
-    if kind == 'hknpMeshShape': return _mesh_obj(t, off)
-    if kind == 'hknpCompoundShape' and depth < 4: return _compound(t, off, depth + 1)
-    return np.zeros((0, 3, 3), np.float32)
+    if kind in ('hknpBoxShape', 'hknpConvexShape', 'hknpConvexPolytopeShape'): r = _convex(t, off)
+    elif kind == 'hknpCapsuleShape': r = _capsule(t, off)
+    elif kind == 'hknpMeshShape': return _mesh_obj(t, off)
+    elif kind == 'hknpCompoundShape' and depth < 4:
+        tris, _, _, tags = _compound(t, off, depth + 1)
+        return tris, tags
+    else: r = np.zeros((0, 3, 3), np.float32)
+    return r, np.zeros(len(r), np.int64)
 
 
 
@@ -243,24 +268,23 @@ def _compound(t, off, depth=0, skip=None, base=0):
         tgt, n = t.rel(off + f)
         k = t.items.get(tgt)
         if k and k[0] == 'hkFreeListArrayElement': inst = (tgt, k[1]); break
-    if not inst: return np.zeros((0, 3, 3), np.float32), 0, np.zeros(0, np.int64)
-    out, ids, cache = [], [], {}
+    empty = np.zeros(0, np.int64)
+    if not inst: return np.zeros((0, 3, 3), np.float32), 0, empty, empty
+    out, ids, tags, cache = [], [], [], {}
     for i in range(inst[1]):
         if skip and base + i in skip: continue
         o = inst[0] + i * 64
         sp, _ = t.rel(o + 48)
         if sp not in t.items: continue
-        if sp not in cache:
-            r = _shape(t, sp, depth)
-            cache[sp] = r[0] if isinstance(r, tuple) else r
-        tris = cache[sp]
+        if sp not in cache: cache[sp] = _shape(t, sp, depth)
+        tris, tg = cache[sp]
         if not len(tris): continue
         q = t.f32(o, 4); tr = t.f32(o + 16, 3); sc = t.f32(o + 32, 3)
         if not np.all(np.isfinite(sc)) or not np.any(sc): sc = np.ones(3, np.float32)
         out.append((tris * sc) @ _quat(q).T + tr)
-        ids.append(np.full(len(tris), base + i, np.int64))
-    if not out: return np.zeros((0, 3, 3), np.float32), inst[1], np.zeros(0, np.int64)
-    return np.concatenate(out), inst[1], np.concatenate(ids)
+        ids.append(np.full(len(tris), base + i, np.int64)); tags.append(tg)
+    if not out: return np.zeros((0, 3, 3), np.float32), inst[1], empty, empty
+    return np.concatenate(out), inst[1], np.concatenate(ids), np.concatenate(tags)
 
 
 def instance_actors(b):
@@ -275,15 +299,45 @@ def instance_actors(b):
 
 
 def file_compounds(b, skip=None):
-    """Baked objects: (triangles, top-level instance index per triangle)."""
-    res, ids, base = [], [], 0
+    """Baked objects: (triangles, top-level instance index per triangle, shape tag per triangle)."""
+    res, ids, tags, base = [], [], [], 0
     for o, sz in tag_sections(b):
         try:
             t = Tag(b, o, sz)
         except Exception:
             continue
         if t.root == 'hknpCompoundShape':
-            tris, n, idx = _compound(t, 0, skip=skip, base=base)
-            res.append(tris); ids.append(idx); base += n
-    if not res: return np.zeros((0, 3, 3), np.float32), np.zeros(0, np.int64)
-    return np.concatenate(res), np.concatenate(ids)
+            tris, n, idx, tg = _compound(t, 0, skip=skip, base=base)
+            res.append(tris); ids.append(idx); tags.append(tg); base += n
+    z = np.zeros(0, np.int64)
+    if not res: return np.zeros((0, 3, 3), np.float32), z, z
+    return np.concatenate(res), np.concatenate(ids), np.concatenate(tags)
+
+
+MAT_DTYPE = np.dtype([('m', '<u4'), ('s', '<u4'), ('f', '<u8')])
+
+
+def materials(b):
+    """Per-file material table (material, submaterial, user shape-tag mask) and, per instance,
+    (first table entry, entry count, shape kind: 1 convex, 2 mesh)."""
+    hdr = struct.unpack_from('<24I', b, 8)
+    table = np.frombuffer(b, MAT_DTYPE, (hdr[7] - hdr[6]) // 16, hdr[6])
+    starts = {}
+    for o in range(hdr[5], hdr[6] - 19, 20):
+        i, flags, _, _, first, count = struct.unpack_from('<IIHHII', b, o)
+        starts[i] = (first, count, flags >> 24)
+    return table, starts
+
+
+def terrain_mesh(b):
+    """Standalone terrain mesh (tile-local): (triangles, shape tag per triangle)."""
+    tris, tags = [], []
+    for o, sz in tag_sections(b):
+        try:
+            t = Tag(b, o, sz)
+        except Exception:
+            continue
+        if t.root == 'hknpMeshShape':
+            tr, tg = _mesh_obj(t, 0); tris.append(tr); tags.append(tg)
+    if not tris: return np.zeros((0, 3, 3), np.float32), np.zeros(0, np.int64)
+    return np.concatenate(tris), np.concatenate(tags)

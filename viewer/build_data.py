@@ -45,6 +45,29 @@ def actor_shapes(name):
     return res
 
 
+def main_shape(name):
+    """Local-space polygons of an actor's main (largest) collision shape, or None."""
+    best = None
+    for sp in actor_shapes(name):
+        a = sp.get('AutoCalc') or {}
+        if not any(isinstance(v, list) and v for k, v in sp.items() if k != 'AutoCalc'): continue
+        if best is None or a.get('Volume', 0) > (best.get('AutoCalc') or {}).get('Volume', 0): best = sp
+    if not best: return None
+    polys = []
+    for b in best.get('Box', []): polys += box(b)
+    for c in best.get('Cylinder', []): polys += cylinder(c)
+    for c in best.get('Capsule', []): polys += cylinder(c)
+    for c in best.get('Sphere', []):
+        r = c.get('Radius', 0.5); ce = v3(c.get('Center')) + v3(c.get('OffsetTranslation'))
+        polys += cylinder({'CenterA': {'X': ce[0], 'Y': ce[1] + r, 'Z': ce[2]}, 'CenterB': {'X': ce[0], 'Y': ce[1] - r, 'Z': ce[2]}, 'Radius': r}, 10)
+    for m in best.get('PhshMesh', []): polys += mesh(m['PhshMeshPath'])
+    if not polys and best.get('AutoCalc'):
+        a = best['AutoCalc']
+        lo, hi = np.array([a['Min'][k] for k in 'XYZ']), np.array([a['Max'][k] for k in 'XYZ'])
+        polys = box({'HalfExtents': dict(zip('XYZ', (hi - lo) / 2)), 'Center': dict(zip('XYZ', (hi + lo) / 2))})
+    return [np.round(np.asarray(p, float), 3).tolist() for p in polys] if polys else None
+
+
 def main_box(name):
     """AABB (min, max) of an object's main collision shape, from the shape's AutoCalc block."""
     best = None
@@ -104,7 +127,7 @@ def place(polys, a):
 
 
 def build(progress=print):
-    out, live_actors, boxes = [], {}, {}
+    out, live_actors, boxes, shapes = [], {}, {}, {}
     files = [(dp, f) for dp, _, fs in os.walk(romfs.path('Banc')) for f in fs if f.endswith('.bcett.byml.zs')]
     for i, (dp, f) in enumerate(files):
         progress('Building collision data: %d/%d %s' % (i + 1, len(files), f))
@@ -116,17 +139,16 @@ def build(progress=print):
             if a.get('Gyaml', '').startswith(ACTOR_KINDS):
                 live_actors[str(h)] = a['Gyaml']
                 if a['Gyaml'] not in boxes: boxes[a['Gyaml']] = main_box(a['Gyaml'])
+                if a['Gyaml'] not in shapes: shapes[a['Gyaml']] = main_shape(a['Gyaml'])
         for a in actors.values():
             name = a.get('Gyaml', '')
             if not WALL.search(name):
                 if a.get('Bakeable') or not name.startswith(OBJ_KEEP) or name.startswith(OBJ_SKIP): continue
-                bb = main_box(name)
-                if bb and np.prod(np.subtract(bb[1], bb[0])) > 1e-4:
-                    lo, hi = np.array(bb[0]), np.array(bb[1])
-                    c, h = (lo + hi) / 2, (hi - lo) / 2
-                    polys = box({'HalfExtents': dict(zip('XYZ', h)), 'Center': dict(zip('XYZ', c))})
+                if name not in shapes: shapes[name] = main_shape(name)
+                polys = shapes[name]
+                if polys:
                     out.append({'scene': scene, 'name': name, 'hash': a['Hash'], 'kind': 'object', 'polys': place(polys, a),
-                                'pos': a.get('Translate', [0, 0, 0])})
+                                'pos': a.get('Translate', [0, 0, 0]), 'scale': a.get('Scale', [1, 1, 1])})
                 continue
             polys = []
             for s in actor_shapes(name):
@@ -165,7 +187,8 @@ def build(progress=print):
                 out.append({'scene': scene, 'name': re.search(r'Module/([^/]+)/', logic).group(1), 'hash': a['Hash'],
                             'kind': kind, 'polys': polys})
     json.dump(out, open(os.path.join(HERE, 'geom.json'), 'w'))
-    json.dump({'actors': live_actors, 'boxes': boxes}, open(os.path.join(HERE, 'actors.json'), 'w'))
+    json.dump({'actors': live_actors, 'boxes': boxes, 'shapes': {k: v for k, v in shapes.items() if v}},
+              open(os.path.join(HERE, 'actors.json'), 'w'))
     return out
 
 
