@@ -229,6 +229,7 @@ class GLView(QOpenGLWidget):
         self.mode = 'game'
         self.orbit = [0.0, 0.5, 14.0]
         self.top_h = 60.0
+        self.top_off = [0.0, 0.0]
         self.drag = None
         self.buffers, self.build_key = {}, None
         self.counts = {'opaque': 0, 'trans': 0, 'lines': 0, 'dyn': 0}
@@ -298,7 +299,7 @@ class GLView(QOpenGLWidget):
         elif self.mode == 'top': self.top_h = min(400, max(5, self.top_h * f))
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.RightButton and self.mode != 'free':
+        if e.button() == Qt.RightButton:
             self.pick_menu(e)
             return
         if e.button() == Qt.LeftButton and self.gizmo_axes:
@@ -376,7 +377,18 @@ class GLView(QOpenGLWidget):
         menu.exec(e.globalPosition().toPoint())
     def mouseReleaseEvent(self, e): self.drag = self.axis_drag = None
 
+    def mouseDoubleClickEvent(self, e):
+        if self.mode == 'top': self.top_off = [0.0, 0.0]
+
     def mouseMoveEvent(self, e):
+        if self.drag is not None and self.mode == 'game':
+            # Dragging the game camera hands over to the free camera, starting from the game's view.
+            self.set_mode('free'); self.app.modes.button(3).setChecked(True)
+        if self.drag is not None and self.mode == 'top':
+            d = e.position() - self.drag; self.drag = e.position()
+            k = self.top_h * 1.15 / max(self.height(), 1)
+            self.top_off[0] -= d.x() * k; self.top_off[1] -= d.y() * k
+            return
         if self.axis_drag:
             axis, last, d, L2 = self.axis_drag
             m = e.position() - last
@@ -415,7 +427,8 @@ class GLView(QOpenGLWidget):
             f = np.array([-math.sin(yaw) * math.cos(pitch), math.sin(pitch), -math.cos(yaw) * math.cos(pitch)], np.float32)
             return look(eye, eye + f), persp(math.radians(60))
         if self.mode == 'top':
-            return look(L + np.array([0, self.top_h, 0.001], np.float32), L, up=(0, 0, -1)), persp(math.radians(60))
+            C = L + np.array([self.top_off[0], 0, self.top_off[1]], np.float32)
+            return look(C + np.array([0, self.top_h, 0.001], np.float32), C, up=(0, 0, -1)), persp(math.radians(60))
         yaw, pitch, dist = self.orbit
         eye = L + dist * np.array([math.sin(yaw) * math.cos(pitch), math.sin(pitch), math.cos(yaw) * math.cos(pitch)], np.float32)
         return look(eye, L), persp(math.radians(55))
@@ -425,6 +438,7 @@ class GLView(QOpenGLWidget):
         rng = app.range.value()
         lx, ly, lz = s['x'], s['y'], s['z']
         if self.mode == 'free' and self.free: lx, lz = self.free[0], self.free[2]
+        if self.mode == 'top': lx, lz = lx + self.top_off[0], lz + self.top_off[1]
         show = {k: cb.isChecked() for k, cb in app.showk.items()}
         height = app.only_height.isChecked()
         ceil = self.mode == 'top' or (app.no_ceiling.isChecked() and self.mode != 'game')
@@ -617,7 +631,7 @@ class GLView(QOpenGLWidget):
         if fl: p.drawText(8, 32, 'Floor: ' + fl)
         p.drawText(8, 16, 'Link %.1f %.1f %.1f   %s' % (s['x'], s['y'], s['z'], self.app.zone_msg))
         if self.app.gizmo: p.drawText(8, H - 24, 'Moving: drag the X/Y/Z arrows (right-click > Stop moving to finish)')
-        p.drawText(8, H - 8, {'game': 'Game camera', 'orbit': 'Orbit: drag to rotate, wheel to zoom', 'top': 'Top-down: wheel to zoom',
+        p.drawText(8, H - 8, {'game': 'Game camera (drag to switch to the free camera)', 'orbit': 'Orbit: drag to rotate, wheel to zoom', 'top': 'Top-down: drag to pan, wheel to zoom, double-click to recentre on Link',
                               'free': 'Free camera: drag to look, WASD move, E/Q or Space/Ctrl up/down, Shift faster (click the view first)'}[self.mode])
         p.end()
 
@@ -626,6 +640,7 @@ GIZMO_LEN = 2.0
 RUNTIME = 0xFFFF000000000000
 SKIP_ACTORS = ('Land_', 'Player', 'Weapon_', 'Armor_', 'Item_Ocarina', 'Camera', 'Event', 'Sound', 'Area', 'Post',
                'Forbid', 'Ground', 'Interest', 'Sky', 'Weather', 'Env', 'Light', 'Fog')
+LISTED = ('Enemy_', 'Npc_', 'Animal_', 'Obj_', 'Item_', 'DgnObj_', 'FldObj_', 'TBox_', 'Land_')
 SYSTEM_ACTORS = {'Exterminator', 'SootCamera', 'PlayerCamera', 'EventCamera'}
 
 
@@ -691,7 +706,7 @@ class App(QWidget):
         self.zone_pick.currentIndexChanged.connect(self.pick_zone); sl.addWidget(self.zone_pick)
         b = QPushButton('Re-detect zone'); b.clicked.connect(self.detect); sl.addWidget(b)
         self.search = QLineEdit(); self.search.setPlaceholderText('Search this map (any name)...'); sl.addWidget(self.search)
-        self.results = QListWidget(); self.results.setFixedHeight(150); sl.addWidget(self.results)
+        self.results = QListWidget(); self.results.setFixedHeight(180); self.results.setStyleSheet('background:#11161b'); sl.addWidget(self.results)
         self.search.textChanged.connect(self.do_search)
         self.search_timer = QTimer(self); self.search_timer.setSingleShot(True); self.search_timer.timeout.connect(lambda: self.do_search(self.search.text()))
         self.results.itemClicked.connect(lambda it: self.go_to(*it.data(Qt.UserRole)))
@@ -784,18 +799,18 @@ class App(QWidget):
         t = text.strip().lower()
         rows = []
         for name, acts in self.live_named.items():
-            if not name.startswith(SKIP_ACTORS) and name not in SYSTEM_ACTORS and t in name.lower():
+            if name.startswith(LISTED) and not name.startswith(SKIP_ACTORS) and t in name.lower():
                 for a in acts[:50]:
                     p = self.game.actor_pos(a)
                     if p and sum(map(abs, p)) > 0.01:
                         h = next((k for k, v in self.live_all.items() if v == a), RUNTIME | a)
-                        rows.append(('%s (live)  %.0f %.0f %.0f' % (name, *p), p, h))
+                        rows.append(('%s (live)  %.0f %.0f %.0f' % (name, *p), p, h, ACTOR_COL.get(name.split('_')[0], QColor(KCOL['object'][0][0], KCOL['object'][0][1], KCOL['object'][0][2]))))
         act = self.active or ()
         for name, kind, scene, c, h in self.data.items:
             if (not act or scene in act) and (t in name.lower() or t in kind):
-                rows.append(('%s [%s]  %.0f %.0f %.0f' % (name, kind, *c), tuple(map(float, c)), h))
-        for label, p, h in rows[:2000]:
-            it = QListWidgetItem(label); it.setData(Qt.UserRole, (p, h)); self.results.addItem(it)
+                rows.append(('%s [%s]  %.0f %.0f %.0f' % (name, kind, *c), tuple(map(float, c)), h, QColor(*KCOL[kind][0]) if kind in KCOL else QColor('white')))
+        for label, p, h, col in rows[:2000]:
+            it = QListWidgetItem(label); it.setData(Qt.UserRole, (p, h)); it.setForeground(col); self.results.addItem(it)
 
     def go_to(self, p, h):
         self.selected = h
