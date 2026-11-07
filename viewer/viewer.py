@@ -6,6 +6,7 @@ from PySide6.QtGui import QColor, QPen, QFont, QMatrix4x4, QPainter, QSurfaceFor
 from PySide6.QtOpenGL import QOpenGLShaderProgram, QOpenGLShader, QOpenGLBuffer, QOpenGLVertexArrayObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QCheckBox, QLabel, QPushButton, QComboBox, QMenu,
+                               QDialog, QDoubleSpinBox, QFormLayout, QDialogButtonBox,
                                QSlider, QRadioButton, QButtonGroup, QFrame, QFileDialog, QMessageBox, QProgressDialog)
 
 import romfs, havok, build_data
@@ -172,7 +173,7 @@ class Data:
         raw = romfs.dec(open(path, 'rb').read())
         owners = {}
         for i, hh in havok.instance_actors(raw).items(): owners.setdefault(hh, []).append(i)
-        self.tile_info[path] = (raw[0x10:0x60], havok.instance_records(raw), owners)
+        self.tile_info[path] = (raw, havok.instance_records(raw), owners)
         c = t.mean(1) if len(t) else np.zeros((0, 3), np.float32)
         self.bounds[path] = (c.min(0), c.max(0)) if len(t) else (np.full(3, 1e9), np.full(3, -1e9))
         self.terrain[path] = (t, c, h, m, sub, f)
@@ -233,6 +234,8 @@ class GLView(QOpenGLWidget):
             self.free = [*map(float, eye), math.atan2(-f[0], -f[2]), math.asin(max(-1, min(1, f[1])))]
             self.setFocus()
 
+    gizmo_axes, axis_drag, pick_point = [], None, None
+
     def keyPressEvent(self, e): self.keys.add(e.key())
     def keyReleaseEvent(self, e): self.keys.discard(e.key())
 
@@ -278,6 +281,15 @@ class GLView(QOpenGLWidget):
         if e.button() == Qt.RightButton and self.mode != 'free':
             self.pick_menu(e)
             return
+        if e.button() == Qt.LeftButton and self.gizmo_axes:
+            x, y = e.position().x(), e.position().y()
+            for axis, a, b in self.gizmo_axes:
+                d = b - a; L2 = d.x() ** 2 + d.y() ** 2
+                if L2 < 1: continue
+                t = max(0, min(1, ((x - a.x()) * d.x() + (y - a.y()) * d.y()) / L2))
+                if math.hypot(a.x() + t * d.x() - x, a.y() + t * d.y() - y) < 9:
+                    self.axis_drag = (axis, e.position(), d, L2)
+                    return
         self.drag = e.position()
 
     def pick(self, x, y):
@@ -301,15 +313,28 @@ class GLView(QOpenGLWidget):
             if len(idx):
                 j = idx[np.argmin(w[idx].mean(1))]
                 depth = float(w[j].mean())
-                if best is None or depth < best[0]: best = (depth, int(hs[j]))
+                if best is None or depth < best[0]: best = (depth, int(hs[j]), tris[j].mean(0))
+        self.pick_point = best[2] if best else None
         return best[1] if best else None
 
     def pick_menu(self, e):
         h = self.pick(e.position().x(), e.position().y())
+        self.app.selected = h
         menu = QMenu(self)
+        pt = self.pick_point
         if h:
             name = self.app.data.hash_name.get(h) or self.app.data.name_of(h) or 'object %x' % h
             menu.addAction('%s' % name).setEnabled(False)
+            menu.addAction('Copy coords of this point (%.2f, %.2f, %.2f)' % tuple(pt), lambda: self.app.copy_coords(pt))
+            live = self.app.live_actor(h)
+            if live:
+                pos = self.app.game.actor_pos(live)
+                if pos: menu.addAction('Copy object position (%.2f, %.2f, %.2f)' % tuple(pos), lambda: self.app.copy_coords(pos))
+                menu.addAction('Move with arrows', lambda: self.app.start_move(h))
+                menu.addAction('Set position...', lambda: self.app.set_position_dialog(h))
+                menu.addAction('Hide in game (send it away, no collision)', lambda: self.app.send_away(h))
+                if h in self.app.moved:
+                    menu.addAction('Put it back where it was', lambda: self.app.put_back(h))
             menu.addAction('Hide this in the viewer', lambda: self.app.hide(h))
             if self.app.baked_tiles(h):
                 if h in self.app.disabled:
@@ -320,12 +345,23 @@ class GLView(QOpenGLWidget):
             menu.addAction('Nothing pickable here').setEnabled(False)
         if self.app.disabled:
             menu.addAction('Re-enable everything I disabled (%d)' % len(self.app.disabled), self.app.restore_all)
+        if self.app.moved:
+            menu.addAction('Put back everything I moved (%d)' % len(self.app.moved), self.app.put_back_all)
+        if self.app.gizmo:
+            menu.addAction('Stop moving', self.app.stop_move)
         if len(self.app.hidden_keys):
             menu.addAction('Show everything hidden (%d)' % len(self.app.hidden_keys), self.app.unhide_all)
         menu.exec(e.globalPosition().toPoint())
-    def mouseReleaseEvent(self, e): self.drag = None
+    def mouseReleaseEvent(self, e): self.drag = self.axis_drag = None
 
     def mouseMoveEvent(self, e):
+        if self.axis_drag:
+            axis, last, d, L2 = self.axis_drag
+            m = e.position() - last
+            step = (m.x() * d.x() + m.y() * d.y()) / L2 * GIZMO_LEN
+            self.axis_drag = (axis, e.position(), d, L2)
+            self.app.nudge(axis, step)
+            return
         if self.drag is not None and self.mode == 'free':
             d = e.position() - self.drag; self.drag = e.position()
             self.free[3] -= d.x() * 0.005
@@ -515,6 +551,35 @@ class GLView(QOpenGLWidget):
                 if abs(c[0] - s['x']) > self.app.range.value() or abs(c[2] - s['z']) > self.app.range.value(): continue
                 q = scr(*c)
                 if q and 0 <= q.x() <= W and 0 <= q.y() <= H: p.drawText(q, name)
+        sel = self.app.selected
+        if sel:
+            p.setPen(QPen(QColor(255, 255, 0), 1)); p.setBrush(Qt.NoBrush)
+            for tris, hs in list(self.picks) + list(self.app.dyn_picks):
+                m = hs == sel
+                if not m.any(): continue
+                for tr in tris[m][:4000]:
+                    pts = [scr(*v) for v in tr]
+                    if all(pts): p.drawPolygon(pts)
+        self.gizmo_axes = []
+        gp = self.app.gizmo_pos()
+        if gp is not None:
+            o = scr(*gp)
+            if o:
+                p.setFont(QFont('Consolas', 10))
+                for axis, col, lab in ((0, QColor(255, 60, 60), 'X'), (1, QColor(60, 255, 60), 'Y'), (2, QColor(80, 140, 255), 'Z')):
+                    tip = list(gp); tip[axis] += GIZMO_LEN
+                    q = scr(*tip)
+                    if not q: continue
+                    p.setPen(QPen(col, 4)); p.drawLine(o, q)
+                    d = q - o; n = math.hypot(d.x(), d.y()) or 1
+                    u, w = QPointF(d.x() / n, d.y() / n), QPointF(-d.y() / n, d.x() / n)
+                    p.setBrush(col); p.setPen(Qt.NoPen)
+                    p.drawPolygon([q + u * 12, q + w * 6, q - w * 6])
+                    p.setPen(col); p.drawText(q + u * 16 + QPointF(-4, 4), lab)
+                    self.gizmo_axes.append((axis, o, q))
+                p.setPen(QColor(255, 255, 0))
+                p.drawText(o + QPointF(10, -10), '%.2f %.2f %.2f' % tuple(gp))
+            p.setFont(QFont('Consolas', 9))
         if self.app.show_actors.isChecked():
             p.setFont(QFont('Consolas', 8))
             for name, (x, y, z) in self.app.actor_pos:
@@ -530,9 +595,13 @@ class GLView(QOpenGLWidget):
         fl = self.floor_under(s)
         if fl: p.drawText(8, 32, 'Floor: ' + fl)
         p.drawText(8, 16, 'Link %.1f %.1f %.1f   %s' % (s['x'], s['y'], s['z'], self.app.zone_msg))
+        if self.app.gizmo: p.drawText(8, H - 24, 'Moving: drag the X/Y/Z arrows (right-click > Stop moving to finish)')
         p.drawText(8, H - 8, {'game': 'Game camera', 'orbit': 'Orbit: drag to rotate, wheel to zoom', 'top': 'Top-down: wheel to zoom',
                               'free': 'Free camera: drag to look, WASD move, E/Q or Space/Ctrl up/down, Shift faster (click the view first)'}[self.mode])
         p.end()
+
+
+GIZMO_LEN = 2.0
 
 
 class App(QWidget):
@@ -547,7 +616,8 @@ class App(QWidget):
         self.obj_actors = {}
         self.manual, self.actor_version, self.detected = None, 0, set()
         self.hidden_version, self.obj_live_keys, self.dyn_picks, self.dyn = 0, None, [], []
-        self.disabled, self.loaded = {}, {}
+        self.disabled, self.loaded, self.selected = {}, {}, None
+        self.moved, self.models, self.gizmo, self.pins = {}, {}, None, {}
         try:
             self.hidden_keys = np.array(json.load(open(os.path.join(HERE, 'hidden.json'))), np.uint64)
         except Exception:
@@ -623,12 +693,8 @@ class App(QWidget):
             return
         done = []
         for path in self.baked_tiles(h):
-            pat, recs, owners = self.data.tile_info[path]
-            base = self.loaded.get(path)
-            if base is None or self.game.raw(self.game.addr['gb'] + base + 0x10, len(pat)) != pat:
-                base = self.game.find_bytes(pat)
-                base = base - 0x10 if base is not None else None
-                self.loaded[path] = base
+            raw, recs, owners = self.data.tile_info[path]
+            base = self.loaded_base(path)
             if base is None: continue
             for i in owners[h]:
                 if i not in recs: continue
@@ -639,9 +705,116 @@ class App(QWidget):
                 self.game.write_u32(addr, ((word[0] & 0xFF) & ~0x48) | 0xFFFFFF00)
         if done:
             self.disabled[h] = done
-            self.zone_msg = 'collision disabled for %d piece(s) - move Link to wake physics' % len(done)
+            self.zone_msg = 'disabled %s: %d piece(s) at %s - move Link to wake physics' % (
+                self.data.name_of(h) or hex(h), len(done), ', '.join('%X' % a for a, _ in done[:3]))
         else:
             self.zone_msg = 'could not find that piece in game memory'
+
+    def loaded_base(self, path):
+        """Guest address where this collision file is loaded in place. Located by one of its instance records
+        (unique), then verified against a second record so a look-alike tile cannot be picked."""
+        raw, recs, owners = self.data.tile_info[path]
+        gbase = self.game.addr['gb']
+        def ok(base):
+            for i in list(recs)[::max(1, len(recs) // 4)][:4]:
+                o = recs[i]
+                if self.game.raw(gbase + base + o, 24) != raw[o:o + 24]: return False
+            return True
+        base = self.loaded.get(path)
+        if base is not None and ok(base): return base
+        idx = sorted(recs)
+        if not idx: return None
+        o = recs[idx[len(idx) // 2]]
+        hit = self.game.find_bytes(raw[o:o + 48])
+        base = hit - o if hit is not None else None
+        if base is not None and not ok(base): base = None
+        self.loaded[path] = base
+        return base
+
+    def live_actor(self, h):
+        return self.actor_objs.get(h) or self.obj_actors.get(h)
+
+    def model_of(self, h):
+        """Model transform object of a live actor, matched by position (cached)."""
+        a = self.live_actor(h)
+        if not a: return None
+        m = self.models.get(h)
+        pos = self.game.actor_pos(a)
+        if m and pos and np.linalg.norm(np.array(self.game.model_pos(m) or (1e9,) * 3) - pos) < 0.05: return m
+        if not pos: return None
+        best = None
+        for addr, p in self.game.models():
+            d = float(np.linalg.norm(np.array(p) - pos))
+            if d < 0.05 and (best is None or d < best[0]): best = (d, addr)
+        self.models[h] = best[1] if best else None
+        return self.models[h]
+
+    def place(self, h, pos):
+        a, m = self.live_actor(h), self.model_of(h)
+        if not a: return
+        if h not in self.moved: self.moved[h] = tuple(self.game.actor_pos(a) or pos)
+        self.game.move(a, m, pos)
+        self.pins[h] = (a, m, tuple(pos))
+        self.zone_msg = 'moved %s to %.2f %.2f %.2f%s' % (self.data.name_of(h) or hex(h), *pos, '' if m else ' (no model found: collision only)')
+
+    def gizmo_pos(self):
+        if not self.gizmo: return None
+        pin = self.pins.get(self.gizmo)
+        if pin: return pin[2]
+        a = self.live_actor(self.gizmo)
+        return self.game.actor_pos(a) if a else None
+
+    def start_move(self, h):
+        self.gizmo = h; self.selected = h
+        if self.model_of(h) is None: self.zone_msg = 'no model transform found for this one; only the actor position will be written'
+
+    def stop_move(self):
+        self.gizmo = None
+
+    def nudge(self, axis, step):
+        p = self.gizmo_pos()
+        if p is None: return
+        p = list(p); p[axis] += step
+        self.place(self.gizmo, p)
+
+    def copy_coords(self, p):
+        QApplication.clipboard().setText('%.3f, %.3f, %.3f' % tuple(p))
+        self.zone_msg = 'copied %.3f, %.3f, %.3f' % tuple(p)
+
+    def set_position_dialog(self, h):
+        a = self.live_actor(h)
+        cur = self.game.actor_pos(a) if a else None
+        if not cur: return
+        dlg = QDialog(self); dlg.setWindowTitle('Set position: ' + (self.data.name_of(h) or hex(h)))
+        form = QFormLayout(dlg); boxes = []
+        for lab, v in zip('XYZ', cur):
+            b = QDoubleSpinBox(); b.setRange(-100000, 100000); b.setDecimals(3); b.setValue(v); form.addRow(lab, b); boxes.append(b)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel); form.addRow(bb)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        if dlg.exec(): self.place(h, [b.value() for b in boxes])
+
+    def send_away(self, h):
+        a = self.live_actor(h)
+        cur = self.game.actor_pos(a) if a else None
+        if cur: self.place(h, [cur[0], cur[1] - 2000, cur[2]])
+
+    def put_back(self, h):
+        orig = self.moved.get(h)
+        if orig is None: return
+        a, m = self.live_actor(h), self.models.get(h)
+        self.game.move(a, m, orig)
+        self.moved.pop(h, None); self.pins.pop(h, None)
+        if self.gizmo == h: self.gizmo = None
+        self.zone_msg = 'put back ' + (self.data.name_of(h) or hex(h))
+
+    def put_back_all(self):
+        for h in list(self.moved): self.put_back(h)
+
+    def keep_pins(self):
+        """Physics objects get their transform rewritten by the game; hold moved ones in place."""
+        for h, (a, m, pos) in list(self.pins.items()):
+            cur = self.game.model_pos(m) if m else self.game.actor_pos(a)
+            if cur and np.linalg.norm(np.array(cur) - pos) > 0.02: self.game.move(a, m, pos)
 
     def restore_all(self):
         for h in list(self.disabled): self.set_collision(h, True)
@@ -696,7 +869,10 @@ class App(QWidget):
                     grp = re.sub(r'_(Static|Dynamic)$', '', best)
                     act = {s for s in ratio if re.sub(r'_(Static|Dynamic)$', '', s) == grp}
                 live = {}
+                for a, (name, h) in self.game.actors().items():
+                    if h and h != 0xFFFFFFFFFFFFFFFF: live.setdefault(h, a)
                 for h, recs in found.items():
+                    if h in live: continue
                     for r in recs:
                         o = self.game.actor_of(r)
                         if o: live[h] = o; break
@@ -753,6 +929,7 @@ class App(QWidget):
                 self.actor_pos, self.dyn = markers, dyn
                 self.obj_live_keys = np.array(sorted(h for h, *_ in dyn if h in self.data.obj_info), np.uint64)
                 self.actor_version += 1
+        if self.pins: self.keep_pins()
         self.view.step_free()
         self.view.update()
 
