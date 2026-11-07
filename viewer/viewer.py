@@ -617,7 +617,7 @@ class App(QWidget):
         self.manual, self.actor_version, self.detected = None, 0, set()
         self.hidden_version, self.obj_live_keys, self.dyn_picks, self.dyn = 0, None, [], []
         self.disabled, self.loaded, self.selected = {}, {}, None
-        self.moved, self.models, self.gizmo, self.pins = {}, {}, None, {}
+        self.moved, self.models, self.gizmo, self.pins, self.live_all = {}, {}, None, {}, {}
         try:
             self.hidden_keys = np.array(json.load(open(os.path.join(HERE, 'hidden.json'))), np.uint64)
         except Exception:
@@ -732,7 +732,7 @@ class App(QWidget):
         return base
 
     def live_actor(self, h):
-        return self.actor_objs.get(h) or self.obj_actors.get(h)
+        return self.actor_objs.get(h) or self.obj_actors.get(h) or self.live_all.get(h)
 
     def model_of(self, h):
         """Model transform object of a live actor, matched by position (cached)."""
@@ -880,6 +880,7 @@ class App(QWidget):
                 if self.manual is None: self.active = act or None
                 self.found_keys = np.array(sorted(hit), np.uint64)
                 self.live_keys = np.array(sorted(live), np.uint64)
+                self.live_all = live
                 self.actor_objs = {h: o for h, o in live.items() if h in self.data.actors}
                 self.obj_actors = {h: o for h, o in live.items() if h in self.data.obj_pos}
                 self.live_version += 1
