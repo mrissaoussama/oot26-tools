@@ -15,16 +15,16 @@ from game import Game
 HERE = os.path.dirname(os.path.abspath(__file__))
 KINDS = [  # key, label, rgb, alpha, shown by default
     ('terrain', 'Terrain / visible collision', (150, 160, 150), 255, True),
-    ('player', 'Invisible walls (block Link)', (255, 60, 60), 90, True),
-    ('climb', 'Climb-only walls', (255, 176, 0), 90, True),
-    ('push', 'Push walls (doors etc.)', (64, 160, 255), 80, False),
-    ('other', 'Enemy / horse / camera walls', (160, 160, 160), 60, False),
-    ('object', 'Objects (pots, chests, blocks...)', (205, 150, 90), 140, True),
-    ('conditional', 'Story-dependent terrain pieces', (120, 200, 255), 70, True),
-    ('void', 'Void-out zones (player fall-down areas)', (210, 60, 255), 80, True),
-    ('loading', 'Loading zones', (255, 240, 80), 70, True),
-    ('norespawn', 'No-respawn areas', (64, 224, 208), 50, False),
-    ('whirlpool', 'Whirlpools', (32, 96, 255), 60, False),
+    ('player', 'Invisible walls (block Link)', (255, 50, 50), 90, True),
+    ('climb', 'Climb-only walls', (255, 220, 0), 90, True),
+    ('push', 'Push walls (doors etc.)', (60, 140, 255), 80, False),
+    ('other', 'Enemy / horse / camera walls', (150, 150, 150), 60, False),
+    ('object', 'Objects (pots, chests, blocks...)', (245, 245, 245), 150, True),
+    ('conditional', 'Story-dependent terrain pieces', (255, 150, 200), 80, True),
+    ('void', 'Fall-down areas (void-out or hole into a grotto)', (170, 60, 255), 80, True),
+    ('loading', 'Loading zones', (140, 255, 60), 70, True),
+    ('norespawn', 'No-respawn areas', (40, 220, 200), 60, False),
+    ('whirlpool', 'Whirlpools', (30, 60, 200), 70, False),
 ]
 KCOL = {k: (c, a) for k, _, c, a, _ in KINDS}
 MAT_NAMES = ['Undefined', 'Soil', 'Grass', 'Sand', 'HeavySand', 'Snow', 'HeavySnow', 'Stone', 'StoneSlip', 'StoneNoSlip',
@@ -40,11 +40,12 @@ SUB_NAMES = ['', 'Soft', 'Hard', 'Light', 'Heavy', 'Marble', 'DgnLight', 'DgnHea
              'SoilBottom', 'StoneLightBottom', 'SandBottom', 'HorseForbidToSlide', 'HammerNoThrough', 'GanonSword', 'KeepAwayDrop']
 FLAG_NAMES = [(0x10, 'Abyss'), (0x10000, 'DisableRespawn'), (0x8000, 'EdgeOfTheWorld'), (0x4, 'Slip'), (0x2, 'Ladder'),
               (0x10000000000, 'Climb'), (0x20000000000, 'NoClamber'), (0x100000000000, 'StickHookshot'), (0x4000, 'Wet')]
-MAT_COL = {1: (150, 115, 80), 2: (95, 160, 75), 3: (210, 190, 120), 4: (200, 175, 100), 5: (235, 240, 250),
-           6: (225, 230, 245), 7: (150, 150, 150), 8: (170, 190, 205), 9: (140, 140, 140), 10: (120, 135, 160),
-           11: (150, 170, 200), 12: (110, 120, 140), 14: (165, 120, 70), 15: (190, 230, 250), 17: (200, 230, 230),
-           28: (60, 120, 230), 29: (90, 140, 230), 30: (120, 170, 240), 31: (255, 90, 20), 32: (100, 90, 60),
-           43: (120, 160, 60), 44: (190, 140, 90), 45: (190, 230, 250)}
+MAT_COL = {1: (140, 100, 60), 2: (80, 160, 60), 3: (225, 205, 130), 4: (205, 180, 100), 5: (250, 250, 255),
+           6: (230, 235, 250), 7: (130, 130, 130), 8: (130, 130, 130), 9: (110, 110, 110), 10: (95, 115, 145),
+           11: (95, 115, 145), 12: (80, 95, 120), 14: (175, 115, 50), 15: (200, 240, 255), 17: (210, 235, 235),
+           28: (60, 120, 230), 29: (90, 140, 230), 30: (120, 170, 240), 31: (255, 110, 0), 32: (95, 85, 55),
+           43: (130, 170, 40), 44: (175, 115, 50), 45: (200, 240, 255)}
+HAZARD_COL = {'Lava': (255, 110, 0), 'Abyss (void)': (90, 0, 140), 'No respawn': (40, 220, 200), 'Slippery': (190, 235, 255)}
 NOT_FOR_LINK = (27, 41)  # AirWall faces are drawn as invisible walls; DropItem only catches items
 
 
@@ -52,10 +53,10 @@ def surface_colors(m, f):
     """Per-triangle RGBA for the surface view: material colour, with hazards overriding it."""
     c = np.full((len(m), 4), (160, 160, 160, 255), np.float32)
     for k, rgb in MAT_COL.items(): c[m == k, :3] = rgb
-    c[(f & 0x4) > 0, :3] = (150, 220, 255)
-    c[(f & 0x10000) > 0, :3] = (40, 200, 200)
-    c[(f & 0x10) > 0, :3] = (150, 0, 150)
-    c[m == 31, :3] = (255, 80, 0)
+    c[(f & 0x4) > 0, :3] = HAZARD_COL['Slippery']
+    c[(f & 0x10000) > 0, :3] = HAZARD_COL['No respawn']
+    c[(f & 0x10) > 0, :3] = HAZARD_COL['Abyss (void)']
+    c[m == 31, :3] = HAZARD_COL['Lava']
     return c
 
 
@@ -66,7 +67,7 @@ def surface_name(m, s, f):
     return name + (' [' + ', '.join(flags) + ']' if flags else '')
 
 
-ACTOR_COL = {'Enemy': QColor(255, 70, 70), 'Npc': QColor(255, 220, 60), 'Animal': QColor(90, 220, 255), 'Obj': QColor(120, 255, 120), 'Item': QColor(120, 255, 120)}
+ACTOR_COL = {'Enemy': QColor(255, 0, 200), 'Npc': QColor(255, 190, 70), 'Animal': QColor(90, 220, 255), 'Obj': QColor(0, 230, 120), 'Item': QColor(0, 230, 120)}
 GL_FLOAT, GL_TRIANGLES, GL_LINES = 0x1406, 0x0004, 0x0001
 
 VS = """
@@ -356,7 +357,8 @@ class GLView(QOpenGLWidget):
         if self.mode == 'free' and self.free: lx, lz = self.free[0], self.free[2]
         show = {k: cb.isChecked() for k, cb in app.showk.items()}
         height = app.only_height.isChecked()
-        ceil = app.no_ceiling.isChecked() and self.mode != 'game'
+        ceil = app.no_ceiling.isChecked() and self.mode != 'game' and any(
+            len(d.tiles.get(sc, {})) == 1 for sc in (app.active or ()))
         key = (round(lx / (rng / 4)), round(lz / (rng / 4)), round(ly / 2) if height or ceil else 0, ceil, rng, tuple(sorted(show.items())),
                app.only_zone.isChecked(), height, tuple(sorted(app.active or ())), len(d.terrain),
                app.only_live.isChecked(), app.live_version, app.surface_mode.isChecked(), app.hidden_version,
@@ -557,14 +559,21 @@ class App(QWidget):
         self.only_live = QCheckBox('Only things that exist right now'); self.only_live.setChecked(True); sl.addWidget(self.only_live)
         self.only_height = QCheckBox("Only walls right around Link"); sl.addWidget(self.only_height)
         self.surface_mode = QCheckBox('Colour terrain by surface (lava, abyss, slip...)'); sl.addWidget(self.surface_mode)
-        self.no_ceiling = QCheckBox('Hide ceilings (for dungeons)'); self.no_ceiling.setChecked(True); sl.addWidget(self.no_ceiling)
+        self.legend = QLabel(); self.legend.setWordWrap(True); self.legend.setVisible(False); sl.addWidget(self.legend)
+        sq = lambda rgb, t: '<span style="color:rgb(%d,%d,%d)">&#9632;</span> %s' % (*rgb, t)
+        mats = [(MAT_COL[k], MAT_NAMES[k]) for k in (2, 1, 7, 3, 5, 14, 10, 15, 28)]
+        self.legend.setText('<small>' + ' &nbsp;'.join(sq(c, n) for c, n in mats) + '<br><b>Hazards:</b> ' +
+                            ' &nbsp;'.join(sq(c, n) for n, c in HAZARD_COL.items()) + '<br><b>Actors:</b> ' +
+                            ' &nbsp;'.join(sq((c.red(), c.green(), c.blue()), n) for n, c in ACTOR_COL.items() if n != 'Item') + '</small>')
+        self.surface_mode.toggled.connect(self.legend.setVisible)
+        self.no_ceiling = QCheckBox('Hide ceilings in dungeons (orbit / top / free views)'); sl.addWidget(self.no_ceiling)
         self.zone_pick = QComboBox(); self.zone_pick.addItem('Zone: follow the game')
         for g in self.data.groups: self.zone_pick.addItem(g)
         self.zone_pick.currentIndexChanged.connect(self.pick_zone); sl.addWidget(self.zone_pick)
         b = QPushButton('Re-detect zone'); b.clicked.connect(self.detect); sl.addWidget(b)
         b = QPushButton('Set romfs folder (for terrain)'); b.clicked.connect(self.pick_romfs); sl.addWidget(b)
-        self.range = QSlider(Qt.Horizontal); self.range.setRange(15, 250); self.range.setValue(60)
-        self.range_lbl = QLabel('Draw distance: 60 units'); sl.addWidget(self.range_lbl); sl.addWidget(self.range)
+        self.range = QSlider(Qt.Horizontal); self.range.setRange(15, 300); self.range.setValue(120)
+        self.range_lbl = QLabel('Draw distance: 120 units'); sl.addWidget(self.range_lbl); sl.addWidget(self.range)
         self.range.valueChanged.connect(lambda v: self.range_lbl.setText('Draw distance: %d units' % v))
         self.info = QLabel(); self.info.setWordWrap(True); sl.addWidget(self.info)
         sl.addStretch(1)
