@@ -336,7 +336,7 @@ class GLView(QOpenGLWidget):
                 if h in self.app.moved:
                     menu.addAction('Put it back where it was', lambda: self.app.put_back(h))
             menu.addAction('Hide this in the viewer', lambda: self.app.hide(h))
-            if self.app.baked_tiles(h):
+            if self.app.baked_tiles(h) and not live:
                 if h in self.app.disabled:
                     menu.addAction('Re-enable collision in game', lambda: self.app.set_collision(h, True))
                 else:
@@ -700,7 +700,7 @@ class App(QWidget):
                 if i not in recs: continue
                 addr = base + recs[i] + 28
                 word = self.game.read(self.game.addr['gb'] + addr, '<I')
-                if not word or (word[0] & 0xFF) & 0x20 == 0: continue
+                if not word or (word[0] & 0xFF) & 0x20 == 0 or (word[0] & 0x40) == 0: continue
                 done.append((addr, word[0]))
                 self.game.write_u32(addr, ((word[0] & 0xFF) & ~0x48) | 0xFFFFFF00)
         if done:
@@ -708,7 +708,7 @@ class App(QWidget):
             self.zone_msg = 'disabled %s: %d piece(s) at %s - move Link to wake physics' % (
                 self.data.name_of(h) or hex(h), len(done), ', '.join('%X' % a for a, _ in done[:3]))
         else:
-            self.zone_msg = 'could not find that piece in game memory'
+            self.zone_msg = 'nothing to disable: that piece is not in memory or the game already switched it off'
 
     def loaded_base(self, path):
         """Guest address where this collision file is loaded in place. Located by one of its instance records
