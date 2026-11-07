@@ -101,21 +101,22 @@ NOT_SOLID = re.compile(r'AirWall|Airwall|Area|Anchor|Camera|Sensor')
 
 
 def load_tile(path, key, tiles, names=None):
-    """Terrain mesh (tile-local) plus baked objects (compound shapes, world space).
-    names: placement hash -> actor name; baked areas and air walls are left out."""
+    """Terrain mesh (tile-local) plus baked objects (world space).
+    Returns (triangles, placement hash per triangle; 0 = plain terrain). Baked areas and air walls are left out."""
     b = romfs.dec(open(path, 'rb').read())
-    skip = None
-    if names:
-        skip = {i for i, h in instance_actors(b).items() if NOT_SOLID.search(names.get(h, ''))}
-    out = []
+    owner = instance_actors(b)
+    skip = {i for i, h in owner.items() if NOT_SOLID.search(names.get(h, ''))} if names else None
+    tris_out, hash_out = [], []
     tris = file_meshes(b)
     if len(tris):
         ok = np.all((tris > -2) & (tris < TILE + 2), axis=(1, 2))
-        out.append(tris[ok] + tile_origin(b, key, tiles))
-    comp = file_compounds(b, skip)
+        tris_out.append(tris[ok] + tile_origin(b, key, tiles)); hash_out.append(np.zeros(int(ok.sum()), np.uint64))
+    comp, idx = file_compounds(b, skip)
     if len(comp):
-        out.append(comp[np.all(np.isfinite(comp) & (np.abs(comp) < 1e5), axis=(1, 2))])
-    return np.concatenate(out) if out else np.zeros((0, 3, 3), np.float32)
+        ok = np.all(np.isfinite(comp) & (np.abs(comp) < 1e5), axis=(1, 2))
+        tris_out.append(comp[ok]); hash_out.append(np.array([owner.get(int(i), 0) for i in idx[ok]], np.uint64))
+    if not tris_out: return np.zeros((0, 3, 3), np.float32), np.zeros(0, np.uint64)
+    return np.concatenate(tris_out), np.concatenate(hash_out)
 
 
 def _varuint(b, p):
@@ -242,8 +243,8 @@ def _compound(t, off, depth=0, skip=None, base=0):
         tgt, n = t.rel(off + f)
         k = t.items.get(tgt)
         if k and k[0] == 'hkFreeListArrayElement': inst = (tgt, k[1]); break
-    if not inst: return np.zeros((0, 3, 3), np.float32), 0
-    out, cache = [], {}
+    if not inst: return np.zeros((0, 3, 3), np.float32), 0, np.zeros(0, np.int64)
+    out, ids, cache = [], [], {}
     for i in range(inst[1]):
         if skip and base + i in skip: continue
         o = inst[0] + i * 64
@@ -257,7 +258,9 @@ def _compound(t, off, depth=0, skip=None, base=0):
         q = t.f32(o, 4); tr = t.f32(o + 16, 3); sc = t.f32(o + 32, 3)
         if not np.all(np.isfinite(sc)) or not np.any(sc): sc = np.ones(3, np.float32)
         out.append((tris * sc) @ _quat(q).T + tr)
-    return np.concatenate(out) if out else np.zeros((0, 3, 3), np.float32), inst[1]
+        ids.append(np.full(len(tris), base + i, np.int64))
+    if not out: return np.zeros((0, 3, 3), np.float32), inst[1], np.zeros(0, np.int64)
+    return np.concatenate(out), inst[1], np.concatenate(ids)
 
 
 def instance_actors(b):
@@ -272,13 +275,15 @@ def instance_actors(b):
 
 
 def file_compounds(b, skip=None):
-    res, base = [], 0
+    """Baked objects: (triangles, top-level instance index per triangle)."""
+    res, ids, base = [], [], 0
     for o, sz in tag_sections(b):
         try:
             t = Tag(b, o, sz)
         except Exception:
             continue
         if t.root == 'hknpCompoundShape':
-            tris, n = _compound(t, 0, skip=skip, base=base)
-            res.append(tris); base += n
-    return np.concatenate(res) if res else np.zeros((0, 3, 3), np.float32)
+            tris, n, idx = _compound(t, 0, skip=skip, base=base)
+            res.append(tris); ids.append(idx); base += n
+    if not res: return np.zeros((0, 3, 3), np.float32), np.zeros(0, np.int64)
+    return np.concatenate(res), np.concatenate(ids)

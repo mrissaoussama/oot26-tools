@@ -103,10 +103,10 @@ class Data:
         return self.names[area]
 
     def _load(self, path, key, tiles, scene):
-        t = havok.load_tile(path, key, tiles, self.names_for(scene))
+        t, h = havok.load_tile(path, key, tiles, self.names_for(scene))
         c = t.mean(1) if len(t) else np.zeros((0, 3), np.float32)
         self.bounds[path] = (c.min(0), c.max(0)) if len(t) else (np.full(3, 1e9), np.full(3, -1e9))
-        self.terrain[path] = (t, c)
+        self.terrain[path] = (t, c, h)
 
 
 def vertices(tris, rgb, a):
@@ -131,7 +131,44 @@ class GLView(QOpenGLWidget):
         self.drag = None
         self.buffers, self.build_key = {}, None
         self.counts = {'opaque': 0, 'trans': 0, 'lines': 0}
+        self.free = None  # [x, y, z, yaw, pitch]
+        self.keys, self.last_t = set(), time.time()
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setMinimumSize(800, 600)
+
+    def set_mode(self, m):
+        self.mode = m
+        if m == 'free':
+            s = self.app.state
+            cam = s and s['cam']
+            if cam:
+                R = cam['view'][:, :3]; eye = -R.T @ cam['view'][:, 3]; f = -R[2]
+            elif s:
+                eye = np.array([s['x'], s['y'] + 6, s['z'] + 10], np.float32); f = np.array([0, -0.4, -1], np.float32)
+            else:
+                eye, f = np.zeros(3, np.float32), np.array([0, 0, -1], np.float32)
+            f = f / np.linalg.norm(f)
+            self.free = [*map(float, eye), math.atan2(-f[0], -f[2]), math.asin(max(-1, min(1, f[1])))]
+            self.setFocus()
+
+    def keyPressEvent(self, e): self.keys.add(e.key())
+    def keyReleaseEvent(self, e): self.keys.discard(e.key())
+
+    def step_free(self):
+        now = time.time(); dt = min(0.1, now - self.last_t); self.last_t = now
+        if self.mode != 'free' or not self.free: return
+        x, y, z, yaw, pitch = self.free
+        sp = (40 if Qt.Key_Shift in self.keys else 12) * dt
+        fwd = np.array([-math.sin(yaw) * math.cos(pitch), math.sin(pitch), -math.cos(yaw) * math.cos(pitch)])
+        right = np.array([math.cos(yaw), 0, -math.sin(yaw)])
+        mv = np.zeros(3)
+        if Qt.Key_W in self.keys: mv += fwd
+        if Qt.Key_S in self.keys: mv -= fwd
+        if Qt.Key_D in self.keys: mv += right
+        if Qt.Key_A in self.keys: mv -= right
+        if Qt.Key_E in self.keys or Qt.Key_Space in self.keys: mv[1] += 1
+        if Qt.Key_Q in self.keys or Qt.Key_Control in self.keys: mv[1] -= 1
+        self.free[:3] = list(np.array([x, y, z]) + mv * sp)
 
     def initializeGL(self):
         self.prog = QOpenGLShaderProgram(self)
@@ -159,6 +196,11 @@ class GLView(QOpenGLWidget):
     def mouseReleaseEvent(self, e): self.drag = None
 
     def mouseMoveEvent(self, e):
+        if self.drag is not None and self.mode == 'free':
+            d = e.position() - self.drag; self.drag = e.position()
+            self.free[3] -= d.x() * 0.005
+            self.free[4] = min(1.55, max(-1.55, self.free[4] - d.y() * 0.005))
+            return
         if self.drag is not None and self.mode == 'orbit':
             d = e.position() - self.drag; self.drag = e.position()
             self.orbit[0] -= d.x() * 0.01
@@ -179,6 +221,11 @@ class GLView(QOpenGLWidget):
         if self.mode == 'game' and s['cam']:
             V = np.eye(4, dtype=np.float32); V[:3] = s['cam']['view']
             return V, persp(s['cam']['fovy'])
+        if self.mode == 'free' and self.free:
+            x, y, z, yaw, pitch = self.free
+            eye = np.array([x, y, z], np.float32)
+            f = np.array([-math.sin(yaw) * math.cos(pitch), math.sin(pitch), -math.cos(yaw) * math.cos(pitch)], np.float32)
+            return look(eye, eye + f), persp(math.radians(60))
         if self.mode == 'top':
             return look(L + np.array([0, self.top_h, 0.001], np.float32), L, up=(0, 0, -1)), persp(math.radians(60))
         yaw, pitch, dist = self.orbit
@@ -189,6 +236,7 @@ class GLView(QOpenGLWidget):
         app, d = self.app, self.app.data
         rng = app.range.value()
         lx, ly, lz = s['x'], s['y'], s['z']
+        if self.mode == 'free' and self.free: lx, lz = self.free[0], self.free[2]
         show = {k: cb.isChecked() for k, cb in app.showk.items()}
         height = app.only_height.isChecked()
         ceil = app.no_ceiling.isChecked() and self.mode != 'game'
@@ -200,6 +248,12 @@ class GLView(QOpenGLWidget):
         zone_ids = [i for i, n in enumerate(d.scene_names) if n in (app.active or ())]
         live = app.only_live.isChecked() and app.found_keys is not None and len(app.found_keys) > 0
         obj = d.kind_names.index('object')
+        def near_link(g):
+            """Shapes that reach Link's height (-2..+4) and come within 12 units of him horizontally."""
+            y0, y1 = g[:, :, 1].min(1), g[:, :, 1].max(1)
+            dx = np.clip(s['x'], g[:, :, 0].min(1), g[:, :, 0].max(1)) - s['x']
+            dz = np.clip(s['z'], g[:, :, 2].min(1), g[:, :, 2].max(1)) - s['z']
+            return (y1 > ly - 2) & (y0 < ly + 4) & (dx * dx + dz * dz < 144)
         def sel(c, ks, ss, k, hs):
             m = (np.abs(c[:, 0] - lx) < rng) & (np.abs(c[:, 2] - lz) < rng) & (ks == k)
             if app.only_zone.isChecked() and app.active: m &= np.isin(ss, zone_ids)
@@ -210,16 +264,18 @@ class GLView(QOpenGLWidget):
         for i, k in enumerate(d.kind_names):
             if k == 'terrain' or not show[k]: continue
             m = sel(d.wc, d.wk, d.ws, i, d.wh)
-            if height: m &= (d.wt[:, :, 1].max(1) > ly - 4) & (d.wt[:, :, 1].min(1) < ly + 12)
+            if height: m &= near_link(d.wt)
             if m.any(): trans.append(vertices(d.wt[m], *KCOL[k]))
             ml = sel(d.lc, d.lk, d.lss, i, d.lh)
+            if height: ml &= near_link(d.ls)
             if ml.any(): lines.append(line_vertices(d.ls[ml], KCOL[k][0]))
         pending = 0
         if show['terrain'] and app.active:
             tl, pending = d.terrain_near(sorted(app.active), lx, lz, rng)
-            for t, c in tl:
+            for t, c, h in tl:
                 m = (np.abs(c[:, 0] - lx) < rng) & (np.abs(c[:, 2] - lz) < rng) if len(t) else None
                 if m is not None and ceil: m &= t[:, :, 1].min(1) < ly + 3.5
+                if m is not None and live: m &= (h == 0) | np.isin(h, app.found_keys)
                 if m is not None and m.any(): opaque.append(vertices(t[m], *KCOL['terrain']))
         cat = lambda L: np.concatenate(L) if L else np.zeros((0, 10), np.float32)
         self.upload('opaque', cat(opaque)); self.upload('trans', cat(trans)); self.upload('lines', cat(lines))
@@ -285,7 +341,8 @@ class GLView(QOpenGLWidget):
             p.setFont(QFont('Consolas', 9))
         p.setPen(QColor('white'))
         p.drawText(8, 16, 'Link %.1f %.1f %.1f   %s' % (s['x'], s['y'], s['z'], self.app.zone_msg))
-        p.drawText(8, H - 8, {'game': 'Game camera', 'orbit': 'Orbit: drag to rotate, wheel to zoom', 'top': 'Top-down: wheel to zoom'}[self.mode])
+        p.drawText(8, H - 8, {'game': 'Game camera', 'orbit': 'Orbit: drag to rotate, wheel to zoom', 'top': 'Top-down: wheel to zoom',
+                              'free': 'Free camera: drag to look, WASD move, E/Q or Space/Ctrl up/down, Shift faster (click the view first)'}[self.mode])
         p.end()
 
 
@@ -303,9 +360,9 @@ class App(QWidget):
         sl = QVBoxLayout(side)
         sl.addWidget(QLabel('<b>View</b>'))
         self.modes = QButtonGroup(self)
-        for i, t in enumerate(['Game camera', 'Orbit around Link (drag)', 'Top-down']):
+        for i, t in enumerate(['Game camera', 'Orbit around Link (drag)', 'Top-down', 'Free camera (drag + WASD)']):
             rb = QRadioButton(t); rb.setChecked(i == 0); self.modes.addButton(rb, i); sl.addWidget(rb)
-        self.modes.idClicked.connect(lambda i: setattr(self.view, 'mode', ['game', 'orbit', 'top'][i]))
+        self.modes.idClicked.connect(lambda i: self.view.set_mode(['game', 'orbit', 'top', 'free'][i]))
         sl.addWidget(QLabel('<b>Show</b>'))
         self.showk = {}
         for k, label, rgb, a, on in KINDS:
@@ -316,7 +373,7 @@ class App(QWidget):
         self.show_names = QCheckBox('Actor names'); sl.addWidget(self.show_names)
         self.only_zone = QCheckBox('Only the loaded zone'); self.only_zone.setChecked(True); sl.addWidget(self.only_zone)
         self.only_live = QCheckBox('Only things that exist right now'); self.only_live.setChecked(True); sl.addWidget(self.only_live)
-        self.only_height = QCheckBox("Walls near Link's height only"); sl.addWidget(self.only_height)
+        self.only_height = QCheckBox("Only walls right around Link"); sl.addWidget(self.only_height)
         self.no_ceiling = QCheckBox('Hide ceilings (for dungeons)'); self.no_ceiling.setChecked(True); sl.addWidget(self.no_ceiling)
         b = QPushButton('Re-detect zone'); b.clicked.connect(self.detect); sl.addWidget(b)
         b = QPushButton('Set romfs folder (for terrain)'); b.clicked.connect(self.pick_romfs); sl.addWidget(b)
@@ -393,6 +450,7 @@ class App(QWidget):
                     if pos and sum(map(abs, pos)) > 0.01 and abs(pos[0] - s["x"]) < rng and abs(pos[2] - s['z']) < rng:
                         out.append((self.data.actors[h], pos))
                 self.actor_pos = out
+        self.view.step_free()
         self.view.update()
 
 
