@@ -735,6 +735,7 @@ class App(QWidget):
         self.moved, self.models, self.gizmo, self.pins, self.live_all, self.live_named, self.runtime = {}, {}, None, {}, {}, {}, {}
         self.target = None
         self.selection = set()
+        self.saved_bodies, self.path_body = {}, None
         try:
             self.hidden_keys = np.array(json.load(open(os.path.join(HERE, 'hidden.json'))), np.uint64)
         except Exception:
@@ -787,6 +788,11 @@ class App(QWidget):
         b = QPushButton('Teleport Link there'); b.clicked.connect(self.teleport_selected); row.addWidget(b)
         b = QPushButton('Kill inv. walls'); b.setToolTip('Disable collision of every invisible wall in this area'); b.clicked.connect(self.disable_all_walls); row.addWidget(b)
         sl.addLayout(row)
+        row = QHBoxLayout()
+        b = QPushButton('Kill death zones'); b.setToolTip('Move every loaded fall-down / quicksand trigger out of the world'); b.clicked.connect(self.disable_death_zones); row.addWidget(b)
+        b = QPushButton('Restore zones'); b.clicked.connect(self.restore_bodies); row.addWidget(b)
+        sl.addLayout(row)
+        self.on_path = QCheckBox('Keep Link on the safe path (no send-back)'); self.on_path.toggled.connect(self.toggle_path); sl.addWidget(self.on_path)
         b = QPushButton('Set romfs folder (for terrain)'); b.clicked.connect(self.pick_romfs); sl.addWidget(b)
         self.range = QSlider(Qt.Horizontal); self.range.setRange(15, 300); self.range.setValue(120)
         self.range_lbl = QLabel('Draw distance: 120 units'); sl.addWidget(self.range_lbl); sl.addWidget(self.range)
@@ -884,6 +890,51 @@ class App(QWidget):
                 rows.append(('%s [%s]  %.0f %.0f %.0f' % (name, kind, *c), tuple(map(float, c)), h, QColor(*KCOL[kind][0]) if kind in KCOL else QColor('white')))
         for label, p, h, col in rows[:2000]:
             it = QListWidgetItem(label); it.setData(Qt.UserRole, (p, h)); it.setForeground(col); self.results.addItem(it)
+
+    def zone_bodies(self, kinds):
+        """[(hash, body address)] for live area triggers of the given kinds in the loaded zone."""
+        act = self.active or ()
+        hs = [h for n, k, s, c, h in self.data.items if k in kinds and (not act or s in act)]
+        live = [(h, self.live_all.get(h)) for h in hs]
+        live = [(h, a, self.game.actor_pos(a)) for h, a in live if a]
+        live = [(h, a, p) for h, a, p in live if p]
+        found = self.game.find_bodies([p for _, _, p in live]) if live else {}
+        return [(live[i][0], B) for i, bs in found.items() for B in bs]
+
+    def disable_death_zones(self):
+        n = 0
+        for h, B in self.zone_bodies(('void',)):
+            if B in self.saved_bodies: continue
+            self.saved_bodies[B] = self.game.raw(self.game.addr['gb'] + B, 0x80)
+            self.game.shift_body(B, 0, -2000, 0); n += 1
+        self.zone_msg = 'moved %d death-zone triggers out of the world (zone reload or Restore zones undoes it)' % n
+
+    def restore_bodies(self):
+        for B, raw in self.saved_bodies.items(): self.game.write(B, raw)
+        self.zone_msg = 'restored %d triggers' % len(self.saved_bodies)
+        self.saved_bodies = {}
+
+    def toggle_path(self, on):
+        if not on:
+            if self.path_body: self.game.write(self.path_body[0], self.path_body[1])
+            self.path_body = None
+            return
+        bs = self.zone_bodies(('safepath',))
+        if not bs:
+            self.zone_msg = 'no safe-path triggers loaded here'; self.on_path.setChecked(False); return
+        B = bs[0][1]
+        self.path_body = (B, self.game.raw(self.game.addr['gb'] + B, 0x80))
+        self.zone_msg = 'a safe-path trigger now follows Link'
+
+    def follow_path(self):
+        s = self.state
+        if not s or not self.path_body: return
+        B, raw = self.path_body
+        cur = self.game.read(self.game.addr['gb'] + B + 0x30, '<3f')
+        if not cur: return
+        c = (s['x'], s['y'] + 0.5, s['z'])
+        if max(abs(a - b) for a, b in zip(cur, c)) > 0.3:
+            self.game.shift_body(B, c[0] - cur[0], c[1] - cur[1], c[2] - cur[2])
 
     def toggle_select(self, h):
         if h in self.selection: self.selection.discard(h)
@@ -1220,6 +1271,7 @@ class App(QWidget):
                 self.obj_live_keys = np.array(sorted(h for h, *_ in dyn if h in self.data.obj_info), np.uint64)
                 self.actor_version += 1
         if self.pins: self.keep_pins()
+        if self.path_body: self.follow_path()
         if getattr(self, '_search_ver', None) != (self.live_version, tuple(sorted(self.active or ()))):
             self._search_ver = (self.live_version, tuple(sorted(self.active or ())))
             self.do_search(self.search.text())

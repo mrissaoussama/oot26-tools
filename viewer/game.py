@@ -173,6 +173,38 @@ class Game:
         k32.WriteProcessMemory(self.h, b, struct.pack('<3d', x, y + 0.585, z), 24, None)
         return True
 
+    def find_bodies(self, positions, lo=0x2160000000, hi=0x2170000000):
+        """Physics bodies (hknpBody, stride 0xC0) placed at the given positions: {index: [body addresses]}.
+        A body starts with a 3x4 rotation; its translation is at +0x30 and its AABB floats at +0x60..+0x78."""
+        gb = self.addr['gb']
+        P = np.array(positions, np.float32)
+        out, a, m = {}, gb + lo, MBI()
+        while a < gb + hi and k32.VirtualQueryEx(self.h, a, ctypes.byref(m), ctypes.sizeof(m)):
+            if m.State == 0x1000 and m.Protect in (0x04, 0x40):
+                for off in range(0, m.RegionSize, 1 << 26):
+                    b = self.raw(m.BaseAddress + off, min(1 << 26, m.RegionSize - off))
+                    if not b: continue
+                    f = np.frombuffer(b[:len(b) // 4 * 4], np.float32)
+                    with np.errstate(invalid='ignore'):
+                        cand = np.where(np.isin(np.round(f[12:-2], 2), np.round(P[:, 0], 2)))[0]
+                    for j in cand:
+                        for i, p in enumerate(P):
+                            if abs(f[j + 12] - p[0]) < 0.01 and abs(f[j + 13] - p[1]) < 0.01 and abs(f[j + 14] - p[2]) < 0.01:
+                                R = f[j:j + 12].reshape(3, 4)[:, :3]
+                                if abs(abs(np.linalg.det(R)) - 1) < 0.02:
+                                    out.setdefault(i, []).append(m.BaseAddress + off + int(j) * 4 - gb)
+            a = m.BaseAddress + m.RegionSize
+        return out
+
+    def shift_body(self, body, dx, dy, dz, raw=None):
+        """Moves a body's translation and AABB by (dx, dy, dz)."""
+        raw = raw or self.raw(self.addr['gb'] + body, 0x80)
+        f = list(struct.unpack('<32f', raw))
+        for k, d in ((12, dx), (13, dy), (14, dz), (24, dx), (25, dy), (26, dz), (28, dx), (29, dy)):
+            f[k] += d
+        f[27] += dz
+        self.write(body, struct.pack('<32f', *f))
+
     def write_u32(self, guest, value):
         if not self.write(guest, struct.pack('<I', value & 0xFFFFFFFF)):
             ce('writeInteger(%d, %d) return 1' % (self.addr['gb'] + guest, value))
