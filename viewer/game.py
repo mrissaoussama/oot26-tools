@@ -1,5 +1,5 @@
 """Live game state via Cheat Engine's cepipe (addresses) and ReadProcessMemory (values)."""
-import ctypes, ctypes.wintypes as wt, struct, time
+import ctypes, ctypes.wintypes as wt, math, struct, time
 import numpy as np
 
 k32 = ctypes.WinDLL('kernel32', use_last_error=True)
@@ -69,7 +69,8 @@ class Game:
         return p[0] if v and M <= v[0] < M + 0x6000000 else None
 
     def actor_pos(self, actor):
-        return self.read(self.addr.get('gb') + actor + 0x31C, '<3f')
+        p = self.read(self.addr.get('gb') + actor + 0x31C, '<3f')
+        return p if p and all(math.isfinite(v) and abs(v) < 1e5 for v in p) else None
 
     def state(self):
         self.refresh()

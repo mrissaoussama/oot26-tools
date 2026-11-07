@@ -51,6 +51,7 @@ class Data:
         kid = {k: i for i, k in enumerate(self.kind_names)}
         tris, tk, ts, th, segs, sk, ss, sh = [], [], [], [], [], [], [], []
         self.scene_items = {}
+        self.obj_pos = {int(o['hash']): o['pos'] for o in geom if o['kind'] == 'object' and 'pos' in o}
         for o in geom:
             self.scene_items.setdefault(o['scene'], set()).add(int(o['hash']))
             k, s = kid[o['kind']], sid[o['scene']]
@@ -248,7 +249,7 @@ class GLView(QOpenGLWidget):
         ceil = app.no_ceiling.isChecked() and self.mode != 'game'
         key = (round(lx / (rng / 4)), round(lz / (rng / 4)), round(ly / 2) if height or ceil else 0, ceil, rng, tuple(sorted(show.items())),
                app.only_zone.isChecked(), height, tuple(sorted(app.active or ())), len(d.terrain),
-               app.only_live.isChecked(), app.live_version)
+               app.only_live.isChecked(), app.live_version, app.obj_version)
         key = key + (len(d.conditional),)
         if key == self.build_key: return
         self.build_key = key
@@ -272,7 +273,12 @@ class GLView(QOpenGLWidget):
             if k in ('terrain', 'conditional') or not show[k]: continue
             m = sel(d.wc, d.wk, d.ws, i, d.wh)
             if height: m &= near_link(d.wt)
-            if m.any(): trans.append(vertices(d.wt[m], *KCOL[k]))
+            if m.any():
+                t = d.wt[m]
+                if k == 'object' and app.obj_delta:
+                    off = np.array([app.obj_delta.get(int(h), (0, 0, 0)) for h in d.wh[m]], np.float32)
+                    t = t + off[:, None, :]
+                trans.append(vertices(t, *KCOL[k]))
             ml = sel(d.lc, d.lk, d.lss, i, d.lh)
             if height: ml &= near_link(d.ls)
             if ml.any(): lines.append(line_vertices(d.ls[ml], KCOL[k][0]))
@@ -365,6 +371,7 @@ class App(QWidget):
         self.state, self.active, self.zone_msg, self.scanning, self.last_pos = None, None, 'zone: detecting...', False, None
         self.found_keys = self.live_keys = None
         self.live_version, self.actor_objs, self.actor_pos, self.last_scan, self.last_actor_read = 0, {}, [], 0, 0
+        self.obj_actors, self.obj_delta, self.obj_version = {}, {}, 0
         lay = QHBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
         side = QFrame(); side.setFixedWidth(250); side.setStyleSheet('background:#1b2026; color:#d0d8e0')
         sl = QVBoxLayout(side)
@@ -431,6 +438,7 @@ class App(QWidget):
                 self.found_keys = np.array(sorted(hit), np.uint64)
                 self.live_keys = np.array(sorted(live), np.uint64)
                 self.actor_objs = {h: o for h, o in live.items() if h in self.data.actors}
+                self.obj_actors = {h: o for h, o in live.items() if h in self.data.obj_pos}
                 self.live_version += 1
                 self.last_scan = time.time()
                 self.zone_msg = 'zone: %s (%.0fs)' % (', '.join(sorted(act)) if act else 'not found, showing all', time.time() - t)
@@ -460,6 +468,18 @@ class App(QWidget):
                     if pos and sum(map(abs, pos)) > 0.01 and abs(pos[0] - s["x"]) < rng and abs(pos[2] - s['z']) < rng:
                         out.append((self.data.actors[h], pos))
                 self.actor_pos = out
+                delta, changed = {}, False
+                for h, obj in self.obj_actors.items():
+                    pos = self.game.actor_pos(obj)
+                    if not pos or sum(map(abs, pos)) < 0.01: continue
+                    p0 = self.data.obj_pos[h]
+                    dv = (pos[0] - p0[0], pos[1] - p0[1], pos[2] - p0[2])
+                    if 0.05 < max(map(abs, dv)) < 60:
+                        delta[h] = dv
+                        old = self.obj_delta.get(h)
+                        changed |= old is None or max(abs(a - b) for a, b in zip(dv, old)) > 0.05
+                if changed or len(delta) != len(self.obj_delta):
+                    self.obj_delta = delta; self.obj_version += 1
         self.view.step_free()
         self.view.update()
 

@@ -6,7 +6,8 @@ from byml import Byml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WALL = re.compile(r'AirWall|Airwall')
-ZONE_LOGIC = [('Gimmick_AreaContact_FallDown_Item', None), ('Gimmick_AreaContact_FallDown', 'void'), ('ItemAbyss', 'void'),
+# FallDown_Item only detects objects/animals; FallDown (incl. Mountain/GanonCastle variants) detects the player.
+ZONE_LOGIC = [('Gimmick_AreaContact_FallDown_Item', None), ('Gimmick_AreaContact_FallDown', 'void'),
               ('InvalidateRestartArea', 'norespawn'), ('Whirlpool', 'whirlpool')]
 ACTOR_KINDS = ('Enemy_', 'Npc_', 'Animal_', 'Item_', 'Obj_Rupee', 'Obj_Heart', 'Obj_FairySpirit')
 OBJ_KEEP = ('Obj_', 'DgnObj_', 'FldObj_', 'TBox_')
@@ -122,7 +123,8 @@ def build(progress=print):
                     lo, hi = np.array(bb[0]), np.array(bb[1])
                     c, h = (lo + hi) / 2, (hi - lo) / 2
                     polys = box({'HalfExtents': dict(zip('XYZ', h)), 'Center': dict(zip('XYZ', c))})
-                    out.append({'scene': scene, 'name': name, 'hash': a['Hash'], 'kind': 'object', 'polys': place(polys, a)})
+                    out.append({'scene': scene, 'name': name, 'hash': a['Hash'], 'kind': 'object', 'polys': place(polys, a),
+                                'pos': a.get('Translate', [0, 0, 0])})
                 continue
             polys = []
             for s in actor_shapes(name):
@@ -131,7 +133,8 @@ def build(progress=print):
                 for m in s.get('PhshMesh', []): polys += mesh(m['PhshMeshPath'])
             if polys:
                 out.append({'scene': scene, 'name': name, 'hash': a['Hash'], 'kind': kind_of(name), 'polys': place(polys, a)})
-        # Death zones: Area actors referenced by fall-down / no-respawn logic. Shape type 3 is a kill plane.
+        # Death zones: Area actors referenced by fall-down / no-respawn logic.
+        # RigidBodyShapeType: 0 sphere, 1 box, 3 cylinder; unit shapes sit on their origin (y 0..1) like AirWall cubes.
         for g in root.get('AiGroups', []):
             logic = g.get('Logic', '')
             kind = next((k for pat, k in ZONE_LOGIC if pat in logic), False)
@@ -139,9 +142,11 @@ def build(progress=print):
             for ref in g.get('References', []):
                 a = actors.get(ref.get('Reference'))
                 if not a or a.get('Gyaml') != 'Area': continue
-                if (a.get('Dynamic') or {}).get('RigidBodyShapeType', 1) == 3:
-                    sq = np.array([[-60, 0, -60], [60, 0, -60], [60, 0, 60], [-60, 0, 60]], float)
-                    polys = place([sq], {**a, 'Scale': [1, 1, 1]})
+                st = (a.get('Dynamic') or {}).get('RigidBodyShapeType', 1)
+                if st == 3:
+                    polys = place(cylinder({'CenterA': {'Y': 1}, 'CenterB': {'Y': 0}, 'Radius': 1.0}), a)
+                elif st == 0:
+                    polys = place(cylinder({'CenterA': {'Y': 1}, 'CenterB': {'Y': -1}, 'Radius': 1.0}), {**a, 'Translate': a.get('Translate', [0, 0, 0])})
                 else:
                     polys = place(box({'OffsetTranslation': {'X': 0, 'Y': 0.5, 'Z': 0}}), a)
                 out.append({'scene': scene, 'name': re.search(r'Module/([^/]+)/', logic).group(1), 'hash': a['Hash'],

@@ -299,6 +299,80 @@ function ltFastTick()
   pcall(ltCalcTick)
 end
 
+-- Free camera: the game rebuilds its camera every frame, so a worker thread keeps overwriting
+-- the view matrix (+8, 3x4 rows), position (+0x38) and look-at (+0x44) of [[main+4E98068]+0x68].
+FC = FC or { enabled=false, speed=12.0 }
+
+local function fcCam()
+  local p = gq(LT.M + 0x4E98068)
+  local c = p and gq(p + 0x68)
+  return c and LT.gb + c
+end
+
+function fcStart()
+  if FC.thread then return end
+  local c = fcCam()
+  if not c then error("camera not found") end
+  local ex, ey, ez = readFloat(c + 0x38), readFloat(c + 0x3C), readFloat(c + 0x40)
+  local tx, ty, tz = readFloat(c + 0x44), readFloat(c + 0x48), readFloat(c + 0x4C)
+  local dx, dy, dz = tx - ex, ty - ey, tz - ez
+  local l = math.sqrt(dx*dx + dy*dy + dz*dz)
+  FC.pos = { ex, ey, ez }
+  FC.yaw = math.atan(dx, dz)
+  FC.pitch = math.asin(dy / l)
+  FC.enabled = true
+  FC.thread = createThread(function()
+    local ok, e = pcall(fcLoop)
+    if not ok then FC.err = tostring(e) end
+    FC.thread = nil
+  end)
+end
+
+function fcLoop()
+    local last, mx, my = getTickCount(), nil, nil
+    while FC.enabled do
+      local now = getTickCount()
+      local dt = math.min(now - last, 100) / 1000
+      last = now
+      if isKeyPressed(VK_RBUTTON) then
+        local x, y = getMousePos()
+        if mx then
+          FC.yaw = FC.yaw - (x - mx) * 0.004
+          FC.pitch = math.max(-1.5, math.min(1.5, FC.pitch - (y - my) * 0.004))
+        end
+        mx, my = x, y
+      else mx = nil end
+      local fx, fy, fz = math.sin(FC.yaw) * math.cos(FC.pitch), math.sin(FC.pitch), math.cos(FC.yaw) * math.cos(FC.pitch)
+      local rx, rz = -math.cos(FC.yaw), math.sin(FC.yaw)
+      local sp = FC.speed * dt * (isKeyPressed(VK_ADD) and 4 or 1)
+      local p = FC.pos
+      if isKeyPressed(VK_NUMPAD8) then p[1], p[2], p[3] = p[1] + fx*sp, p[2] + fy*sp, p[3] + fz*sp end
+      if isKeyPressed(VK_NUMPAD5) then p[1], p[2], p[3] = p[1] - fx*sp, p[2] - fy*sp, p[3] - fz*sp end
+      if isKeyPressed(VK_NUMPAD6) then p[1], p[3] = p[1] + rx*sp, p[3] + rz*sp end
+      if isKeyPressed(VK_NUMPAD4) then p[1], p[3] = p[1] - rx*sp, p[3] - rz*sp end
+      if isKeyPressed(VK_NUMPAD9) then p[2] = p[2] + sp end
+      if isKeyPressed(VK_NUMPAD3) then p[2] = p[2] - sp end
+      -- view rows: right, up, back; translation = -R * eye
+      local ux, uy, uz = -rz * fy, rz * fx - rx * fz, rx * fy
+      local ul = math.sqrt(ux*ux + uy*uy + uz*uz)
+      ux, uy, uz = ux / ul, uy / ul, uz / ul
+      local R = { rx, 0, rz, ux, uy, uz, -fx, -fy, -fz }
+      local c = fcCam()
+      if c then
+        for i = 0, 2 do
+          local a, b, d = R[i*3+1], R[i*3+2], R[i*3+3]
+          writeFloat(c + 8 + i*16, a) writeFloat(c + 12 + i*16, b) writeFloat(c + 16 + i*16, d)
+          writeFloat(c + 20 + i*16, -(a*p[1] + b*p[2] + d*p[3]))
+        end
+        writeFloat(c + 0x38, p[1]) writeFloat(c + 0x3C, p[2]) writeFloat(c + 0x40, p[3])
+        writeFloat(c + 0x44, p[1] + fx) writeFloat(c + 0x48, p[2] + fy) writeFloat(c + 0x4C, p[3] + fz)
+      end
+      sleep(0)
+    end
+end
+
+function fcStop() FC.enabled = false end
+
 function ltStart()
   ltStop()
   if not LT.pipe then LT.pipe = pcall(openLuaServer, "cepipe") end
@@ -371,12 +445,26 @@ if syntaxcheck then return end
 if SP then SP.enabled = false end
 {$asm}
 </AssemblerScript></CheatEntry>
-<CheatEntry><ID>6</ID><Description>"Link health"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>4</ID><Description>"Health (1 = quarter heart)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>4 Bytes</VariableType><Address>linkhp</Address></CheatEntry><CheatEntry><ID>5</ID><Description>"Max health (4 per heart)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>4 Bytes</VariableType><Address>linkhpmax</Address></CheatEntry></CheatEntries></CheatEntry>
-<CheatEntry><ID>10</ID><Description>"Link position (double, writable = teleport)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>7</ID><Description>"X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos</Address></CheatEntry><CheatEntry><ID>8</ID><Description>"Y (physics = world Y + 0.585)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos+8</Address></CheatEntry><CheatEntry><ID>9</ID><Description>"Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos+10</Address></CheatEntry></CheatEntries></CheatEntry>
-<CheatEntry><ID>22</ID><Description>"Link motion (read-only: game rewrites these every frame)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>11</ID><Description>"Velocity X (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+388</Address></CheatEntry><CheatEntry><ID>12</ID><Description>"Velocity Y (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+38C</Address></CheatEntry><CheatEntry><ID>13</ID><Description>"Velocity Z (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+390</Address></CheatEntry><CheatEntry><ID>14</ID><Description>"Turn rate (rad/s, + = left)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+398</Address></CheatEntry><CheatEntry><ID>15</ID><Description>"Facing X (sin)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+330</Address></CheatEntry><CheatEntry><ID>16</ID><Description>"Facing Z (cos)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+328</Address></CheatEntry><CheatEntry><ID>17</ID><Description>"Speed horizontal (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc</Address></CheatEntry><CheatEntry><ID>18</ID><Description>"Speed 3D (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+4</Address></CheatEntry><CheatEntry><ID>19</ID><Description>"Accel horizontal (calc, units/s^2)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+8</Address></CheatEntry><CheatEntry><ID>20</ID><Description>"Heading deg (calc, 0 = +Z)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+C</Address></CheatEntry><CheatEntry><ID>21</ID><Description>"Vertical speed (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+10</Address></CheatEntry></CheatEntries></CheatEntry>
-<CheatEntry><ID>29</ID><Description>"Camera (from player data, read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>23</ID><Description>"Camera X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam</Address></CheatEntry><CheatEntry><ID>24</ID><Description>"Camera Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam+4</Address></CheatEntry><CheatEntry><ID>25</ID><Description>"Camera Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam+8</Address></CheatEntry><CheatEntry><ID>26</ID><Description>"Camera yaw deg (calc, direction it looks, 0 = +Z)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+14</Address></CheatEntry><CheatEntry><ID>27</ID><Description>"Camera pitch deg (calc, - = looking down)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+18</Address></CheatEntry><CheatEntry><ID>28</ID><Description>"Camera distance from Link (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+1C</Address></CheatEntry></CheatEntries></CheatEntry>
-<CheatEntry><ID>37</ID><Description>"Game camera (read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>30</ID><Description>"Position X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+38</Address></CheatEntry><CheatEntry><ID>31</ID><Description>"Position Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+3C</Address></CheatEntry><CheatEntry><ID>32</ID><Description>"Position Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+40</Address></CheatEntry><CheatEntry><ID>33</ID><Description>"Look-at X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+44</Address></CheatEntry><CheatEntry><ID>34</ID><Description>"Look-at Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+48</Address></CheatEntry><CheatEntry><ID>35</ID><Description>"Look-at Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+4C</Address></CheatEntry><CheatEntry><ID>36</ID><Description>"FOV (radians)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+130</Address></CheatEntry></CheatEntries></CheatEntry>
-<CheatEntry><ID>41</ID><Description>"Link position (display, read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>38</ID><Description>"X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+29C</Address></CheatEntry><CheatEntry><ID>39</ID><Description>"Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+2A0</Address></CheatEntry><CheatEntry><ID>40</ID><Description>"Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+2A4</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>4</ID><Description>"Free camera (numpad 8456 move, 9/3 up/down, right mouse = look)"</Description><VariableType>Auto Assembler Script</VariableType><AssemblerScript>[ENABLE]
+{$lua}
+if syntaxcheck then return end
+if not (LT and LT.gb) then error("Enable 'Link tools' first") end
+-- numpad 8/5 forward/back, 4/6 left/right, 9/3 up/down, numpad + faster, hold right mouse button to look
+FC.speed = 12.0
+fcStart()
+{$asm}
+[DISABLE]
+{$lua}
+if syntaxcheck then return end
+if fcStop then fcStop() end
+{$asm}
+</AssemblerScript></CheatEntry>
+<CheatEntry><ID>7</ID><Description>"Link health"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>5</ID><Description>"Health (1 = quarter heart)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>4 Bytes</VariableType><Address>linkhp</Address></CheatEntry><CheatEntry><ID>6</ID><Description>"Max health (4 per heart)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>4 Bytes</VariableType><Address>linkhpmax</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>11</ID><Description>"Link position (double, writable = teleport)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>8</ID><Description>"X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos</Address></CheatEntry><CheatEntry><ID>9</ID><Description>"Y (physics = world Y + 0.585)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos+8</Address></CheatEntry><CheatEntry><ID>10</ID><Description>"Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Double</VariableType><Address>linkpos+10</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>23</ID><Description>"Link motion (read-only: game rewrites these every frame)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>12</ID><Description>"Velocity X (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+388</Address></CheatEntry><CheatEntry><ID>13</ID><Description>"Velocity Y (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+38C</Address></CheatEntry><CheatEntry><ID>14</ID><Description>"Velocity Z (units/s)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+390</Address></CheatEntry><CheatEntry><ID>15</ID><Description>"Turn rate (rad/s, + = left)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+398</Address></CheatEntry><CheatEntry><ID>16</ID><Description>"Facing X (sin)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+330</Address></CheatEntry><CheatEntry><ID>17</ID><Description>"Facing Z (cos)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkobj+328</Address></CheatEntry><CheatEntry><ID>18</ID><Description>"Speed horizontal (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc</Address></CheatEntry><CheatEntry><ID>19</ID><Description>"Speed 3D (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+4</Address></CheatEntry><CheatEntry><ID>20</ID><Description>"Accel horizontal (calc, units/s^2)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+8</Address></CheatEntry><CheatEntry><ID>21</ID><Description>"Heading deg (calc, 0 = +Z)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+C</Address></CheatEntry><CheatEntry><ID>22</ID><Description>"Vertical speed (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+10</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>30</ID><Description>"Camera (from player data, read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>24</ID><Description>"Camera X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam</Address></CheatEntry><CheatEntry><ID>25</ID><Description>"Camera Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam+4</Address></CheatEntry><CheatEntry><ID>26</ID><Description>"Camera Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcam+8</Address></CheatEntry><CheatEntry><ID>27</ID><Description>"Camera yaw deg (calc, direction it looks, 0 = +Z)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+14</Address></CheatEntry><CheatEntry><ID>28</ID><Description>"Camera pitch deg (calc, - = looking down)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+18</Address></CheatEntry><CheatEntry><ID>29</ID><Description>"Camera distance from Link (calc)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>linkcalc+1C</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>38</ID><Description>"Game camera (read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>31</ID><Description>"Position X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+38</Address></CheatEntry><CheatEntry><ID>32</ID><Description>"Position Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+3C</Address></CheatEntry><CheatEntry><ID>33</ID><Description>"Position Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+40</Address></CheatEntry><CheatEntry><ID>34</ID><Description>"Look-at X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+44</Address></CheatEntry><CheatEntry><ID>35</ID><Description>"Look-at Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+48</Address></CheatEntry><CheatEntry><ID>36</ID><Description>"Look-at Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+4C</Address></CheatEntry><CheatEntry><ID>37</ID><Description>"FOV (radians)"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4E98068]+68]+130</Address></CheatEntry></CheatEntries></CheatEntry>
+<CheatEntry><ID>42</ID><Description>"Link position (display, read-only)"</Description><GroupHeader>1</GroupHeader><CheatEntries><CheatEntry><ID>39</ID><Description>"X"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+29C</Address></CheatEntry><CheatEntry><ID>40</ID><Description>"Y"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+2A0</Address></CheatEntry><CheatEntry><ID>41</ID><Description>"Z"</Description><ShowAsSigned>1</ShowAsSigned><VariableType>Float</VariableType><Address>guestbase+[guestbase+[gamemain+4C7E740]]+2A4</Address></CheatEntry></CheatEntries></CheatEntry>
 </CheatEntries>
 <UserdefinedSymbols/>
 </CheatTable>
