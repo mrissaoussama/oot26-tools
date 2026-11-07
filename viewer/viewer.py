@@ -338,17 +338,72 @@ class GLView(QOpenGLWidget):
         self.pick_point = best[2] if best else None
         return best[1] if best else None
 
+    def ray(self, x, y):
+        """World-space origin and unit direction of the view ray through screen point (x, y)."""
+        inv = np.linalg.inv(self.mvp)
+        nx, ny = 2 * x / self.width() - 1, 1 - 2 * y / self.height()
+        a, b = inv @ np.array([nx, ny, -1, 1]), inv @ np.array([nx, ny, 1, 1])
+        a, b = a[:3] / a[3], b[:3] / b[3]
+        d = b - a
+        return a, d / np.linalg.norm(d)
+
+    def ray_point(self, x, y):
+        """Nearest drawn triangle hit by the ray (terrain included), or a point 20 units along it."""
+        o, d = self.ray(x, y)
+        best = None
+        sets = [t for t, *_ in self.floor] + [t for t, _ in self.picks] + [t for t, _ in self.app.dyn_picks]
+        for T in sets:
+            if not len(T): continue
+            e1, e2 = T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]
+            p = np.cross(d, e2); det = (e1 * p).sum(1)
+            ok = np.abs(det) > 1e-9
+            inv = np.where(ok, 1 / np.where(ok, det, 1), 0)
+            s = o - T[:, 0]; u = (s * p).sum(1) * inv
+            q = np.cross(s, e1); w = (q * d).sum(1) * inv
+            t = (q * e2).sum(1) * inv
+            hit = ok & (u >= 0) & (w >= 0) & (u + w <= 1) & (t > 0.05)
+            if hit.any():
+                tm = float(t[hit].min())
+                if best is None or tm < best: best = tm
+        return (o + d * best, True) if best is not None else (o + d * 20, False)
+
+    def camera_eye(self):
+        if self.mode == 'free' and self.free: return np.array(self.free[:3])
+        R = self.V[:3, :3]
+        return -R.T @ self.V[:3, 3]
+
+    def look_at(self, p):
+        eye = self.camera_eye()
+        f = np.array(p) - eye; f /= np.linalg.norm(f) or 1
+        self.set_mode('free'); self.app.modes.button(3).setChecked(True)
+        self.free = [*map(float, eye), math.atan2(-f[0], -f[2]), math.asin(max(-1, min(1, f[1])))]
+
+    def fly_to(self, p):
+        eye = self.camera_eye()
+        f = np.array(p) - eye; dist = np.linalg.norm(f) or 1; f /= dist
+        new = np.array(p) - f * 6 + np.array([0, 2, 0])
+        f2 = np.array(p) - new; f2 /= np.linalg.norm(f2)
+        self.set_mode('free'); self.app.modes.button(3).setChecked(True)
+        self.free = [*map(float, new), math.atan2(-f2[0], -f2[2]), math.asin(max(-1, min(1, f2[1])))]
+
     def pick_menu(self, e):
-        h = self.pick(e.position().x(), e.position().y())
+        x, y = e.position().x(), e.position().y()
+        h = self.pick(x, y)
         self.app.selected = h
-        if self.pick_point is not None: self.app.target = tuple(map(float, self.pick_point))
+        rp, hit = self.ray_point(x, y)
+        pt = self.pick_point if self.pick_point is not None else rp
+        pt = tuple(map(float, pt))
+        self.app.target = pt
         menu = QMenu(self)
-        pt = self.pick_point
+        menu.addAction(('Point %.2f, %.2f, %.2f' if hit or h else 'Empty space: point 20 units ahead %.2f, %.2f, %.2f') % pt).setEnabled(False)
+        menu.addAction('Teleport Link here', lambda: self.app.teleport(pt))
+        menu.addAction('Point camera here', lambda: self.look_at(pt))
+        menu.addAction('Fly camera here', lambda: self.fly_to(pt))
+        menu.addAction('Copy coords of this point', lambda: self.app.copy_coords(pt))
         if h:
+            menu.addSeparator()
             name = self.app.name_of(h) or 'object %x' % h
             menu.addAction('%s' % name).setEnabled(False)
-            menu.addAction('Copy coords of this point (%.2f, %.2f, %.2f)' % tuple(pt), lambda: self.app.copy_coords(pt))
-            menu.addAction('Teleport Link here', lambda: self.app.teleport(pt))
             live = self.app.live_actor(h, pt)
             if live:
                 pos = self.app.game.actor_pos(live)
@@ -364,8 +419,7 @@ class GLView(QOpenGLWidget):
                     menu.addAction('Re-enable collision in game', lambda: self.app.set_collision(h, True))
                 else:
                     menu.addAction('Disable collision in game', lambda: self.app.set_collision(h, False))
-        else:
-            menu.addAction('Nothing pickable here').setEnabled(False)
+        menu.addSeparator()
         if self.app.disabled:
             menu.addAction('Re-enable everything I disabled (%d)' % len(self.app.disabled), self.app.restore_all)
         if self.app.moved:
@@ -544,7 +598,7 @@ class GLView(QOpenGLWidget):
         self.rebuild(s)
         V, P = self.matrices(s, self.width(), self.height())
         M = P @ V
-        self.mvp = M
+        self.mvp, self.V = M, V
         self.prog.bind(); self.vao.bind()
         self.prog.setUniformValue(self.u_mvp, QMatrix4x4(*M.flatten().tolist()))
         f.glEnable(0x0B71); f.glDisable(0x0BE2)  # depth test on, blend off
