@@ -79,6 +79,28 @@ class Game:
         p = self.read(self.addr.get('gb') + actor + 0x31C, '<3f')
         return p if p and all(math.isfinite(v) and abs(v) < 1e5 for v in p) else None
 
+    def actors(self, lo=0x2140000000, hi=0x2160000000):
+        """All live actors: {actor address: (name, placement hash)}. Every actor shares the base vtable at main+4B25E18."""
+        gb, M = self.addr.get('gb'), self.addr.get('M')
+        vt = np.uint64(M + 0x4B25E18)
+        out, a, m = {}, gb + lo, MBI()
+        while a < gb + hi and k32.VirtualQueryEx(self.h, a, ctypes.byref(m), ctypes.sizeof(m)):
+            if m.State == 0x1000 and m.Protect in (0x04, 0x40):
+                for off in range(0, m.RegionSize, 1 << 25):
+                    buf = self.raw(m.BaseAddress + off, min(1 << 25, m.RegionSize - off))
+                    if not buf: continue
+                    arr = np.frombuffer(buf[:len(buf) // 8 * 8], np.uint64)
+                    for i in np.where(arr == vt)[0]:
+                        act = m.BaseAddress + off + int(i) * 8 - gb
+                        np_ = self.read(gb + act + 0x20, '<Q')
+                        name = self.raw(gb + np_[0], 64) if np_ and 0x2000000000 <= np_[0] < 0x2400000000 else None
+                        name = name.split(b'\0')[0].decode('latin1', 'replace') if name else ''
+                        rec = self.read(gb + act + 0x3D8, '<Q')
+                        h = self.read(gb + rec[0] + 0x88, '<Q') if rec and 0x2000000000 <= rec[0] < 0x2400000000 else None
+                        out[act] = (name, h[0] if h else 0)
+            a = m.BaseAddress + m.RegionSize
+        return out
+
     def state(self):
         self.refresh()
         p = self.read(self.addr.get('linkpos'), '<3d')
