@@ -104,7 +104,7 @@ def place(polys, a):
 
 
 def build(progress=print):
-    out, live_actors = [], {}
+    out, live_actors, boxes = [], {}, {}
     files = [(dp, f) for dp, _, fs in os.walk(romfs.path('Banc')) for f in fs if f.endswith('.bcett.byml.zs')]
     for i, (dp, f) in enumerate(files):
         progress('Building collision data: %d/%d %s' % (i + 1, len(files), f))
@@ -113,7 +113,9 @@ def build(progress=print):
         scene = f.replace('.bcett.byml.zs', '')
         actors = {a['Hash']: a for a in root.get('Actors', [])}
         for h, a in actors.items():
-            if a.get('Gyaml', '').startswith(ACTOR_KINDS): live_actors[str(h)] = a['Gyaml']
+            if a.get('Gyaml', '').startswith(ACTOR_KINDS):
+                live_actors[str(h)] = a['Gyaml']
+                if a['Gyaml'] not in boxes: boxes[a['Gyaml']] = main_box(a['Gyaml'])
         for a in actors.values():
             name = a.get('Gyaml', '')
             if not WALL.search(name):
@@ -137,6 +139,17 @@ def build(progress=print):
         # RigidBodyShapeType: 0 sphere, 1 box, 3 cylinder; unit shapes sit on their origin (y 0..1) like AirWall cubes.
         for g in root.get('AiGroups', []):
             logic = g.get('Logic', '')
+            if 'FieldDungeonEntranceSet' in logic:
+                refs = [actors.get(r.get('Reference')) for r in g.get('References', [])]
+                dest = next(((a.get('Dynamic') or {}) for a in refs if a and a.get('Gyaml') == 'FieldAndDungeonEntranceEventRequestActor'), {})
+                label = dest.get('NextBancParamNameChild') or dest.get('NextBancParamNameAdult') or '?'
+                if dest.get('NextBancParamNameAdult') and dest.get('NextBancParamNameAdult') != dest.get('NextBancParamNameChild'):
+                    label += ' / ' + dest['NextBancParamNameAdult']
+                for a in refs:
+                    if a and a.get('Gyaml') == 'Area':
+                        out.append({'scene': scene, 'name': 'to ' + label, 'hash': a['Hash'], 'kind': 'loading',
+                                    'polys': place(box({'OffsetTranslation': {'X': 0, 'Y': 0.5, 'Z': 0}}), a)})
+                continue
             kind = next((k for pat, k in ZONE_LOGIC if pat in logic), False)
             if not kind: continue
             for ref in g.get('References', []):
@@ -152,7 +165,7 @@ def build(progress=print):
                 out.append({'scene': scene, 'name': re.search(r'Module/([^/]+)/', logic).group(1), 'hash': a['Hash'],
                             'kind': kind, 'polys': polys})
     json.dump(out, open(os.path.join(HERE, 'geom.json'), 'w'))
-    json.dump(live_actors, open(os.path.join(HERE, 'actors.json'), 'w'))
+    json.dump({'actors': live_actors, 'boxes': boxes}, open(os.path.join(HERE, 'actors.json'), 'w'))
     return out
 
 

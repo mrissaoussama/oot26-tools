@@ -1,11 +1,11 @@
 """OoT collision viewer: terrain collision, invisible walls, void zones and Link, in 3D."""
-import json, math, os, sys, threading, time
+import json, math, os, re, sys, threading, time
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, QPointF
 from PySide6.QtGui import QColor, QPen, QFont, QMatrix4x4, QPainter, QSurfaceFormat
 from PySide6.QtOpenGL import QOpenGLShaderProgram, QOpenGLShader, QOpenGLBuffer, QOpenGLVertexArrayObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QCheckBox, QLabel, QPushButton,
+from PySide6.QtWidgets import (QApplication, QWidget, QHBoxLayout, QVBoxLayout, QCheckBox, QLabel, QPushButton, QComboBox,
                                QSlider, QRadioButton, QButtonGroup, QFrame, QFileDialog, QMessageBox, QProgressDialog)
 
 import romfs, havok, build_data
@@ -21,7 +21,8 @@ KINDS = [  # key, label, rgb, alpha, shown by default
     ('other', 'Enemy / horse / camera walls', (160, 160, 160), 60, False),
     ('object', 'Objects (pots, chests, blocks...)', (205, 150, 90), 140, True),
     ('conditional', 'Story-dependent terrain pieces', (120, 200, 255), 70, True),
-    ('void', 'Void-out zones', (210, 60, 255), 80, True),
+    ('void', 'Void-out zones (player fall-down areas)', (210, 60, 255), 80, True),
+    ('loading', 'Loading zones', (255, 240, 80), 70, True),
     ('norespawn', 'No-respawn areas', (64, 224, 208), 50, False),
     ('whirlpool', 'Whirlpools', (32, 96, 255), 60, False),
 ]
@@ -64,7 +65,12 @@ class Data:
         self.wt, self.wk, self.ws, self.wh = np.concatenate(tris), np.array(tk), np.array(ts), np.array(th, np.uint64)
         self.lh = np.array(sh, np.uint64)
         apath = os.path.join(HERE, 'actors.json')
-        self.actors = {int(h): n for h, n in json.load(open(apath)).items()} if os.path.exists(apath) else {}
+        aj = json.load(open(apath)) if os.path.exists(apath) else {}
+        self.actors = {int(h): n for h, n in aj.get('actors', {}).items()}
+        self.actor_boxes = {n: b for n, b in aj.get('boxes', {}).items() if b}
+        self.loading_zones = [(np.concatenate([np.array(p) for p in o['polys']]).mean(0), o['name'], o['scene'], int(o['hash']))
+                        for o in geom if o['kind'] == 'loading']
+        self.groups = sorted({re.sub(r'_(Static|Dynamic)$', '', s) for s in self.scene_names})
         self.wc = self.wt.mean(1)
         self.ls, self.lk, self.lss = np.concatenate(segs), np.array(sk), np.array(ss)
         self.lc = self.ls.mean(1)
@@ -137,7 +143,8 @@ class GLView(QOpenGLWidget):
         self.top_h = 60.0
         self.drag = None
         self.buffers, self.build_key = {}, None
-        self.counts = {'opaque': 0, 'trans': 0, 'lines': 0}
+        self.counts = {'opaque': 0, 'trans': 0, 'lines': 0, 'dyn': 0}
+        self.dyn_version = -1
         self.free = None  # [x, y, z, yaw, pitch]
         self.keys, self.last_t = set(), time.time()
         self.setFocusPolicy(Qt.StrongFocus)
@@ -320,8 +327,12 @@ class GLView(QOpenGLWidget):
         self.prog.setUniformValue(self.u_mvp, QMatrix4x4(*M.flatten().tolist()))
         f.glEnable(0x0B71); f.glDisable(0x0BE2)  # depth test on, blend off
         self.draw('opaque', GL_TRIANGLES, 1)
+        if self.dyn_version != self.app.actor_version:
+            self.dyn_version = self.app.actor_version
+            self.upload('dyn', self.app.actor_mesh())
         f.glEnable(0x0BE2); f.glBlendFunc(0x0302, 0x0303); f.glDepthMask(False)
         self.draw('trans', GL_TRIANGLES, 1)
+        if self.app.show_actors.isChecked(): self.draw('dyn', GL_TRIANGLES, 1)
         f.glDepthMask(True)
         self.draw('lines', GL_LINES, 0)
         self.vao.release(); self.prog.release()
@@ -337,13 +348,22 @@ class GLView(QOpenGLWidget):
         def scr(x, y, z):
             v = M @ np.array([x, y, z, 1], np.float32)
             return QPointF((v[0] / v[3] + 1) * W / 2, (1 - v[1] / v[3]) * H / 2) if v[3] > 0.1 else None
-        for off, col, r in ((0.9, QColor(64, 255, 96), 7), (0.0, QColor(30, 140, 50), 3)):
+        far = self.app.manual is not None and not (self.app.manual & self.app.detected)
+        for off, col, r in (() if far else ((0.9, QColor(64, 255, 96), 7), (0.0, QColor(30, 140, 50), 3))):
             q = scr(s['x'], s['y'] + off, s['z'])
             if q: p.setBrush(col); p.setPen(QPen(QColor('black'), 1)); p.drawEllipse(q, r, r)
-        if s['face']:
+        if s['face'] and not far:
             a = scr(s['x'], s['y'] + 0.9, s['z'])
             b = scr(s['x'] + s['face'][0] * 1.5, s['y'] + 0.9, s['z'] + s['face'][1] * 1.5)
             if a and b: p.setPen(QPen(QColor(64, 255, 96), 2)); p.drawLine(a, b)
+        if self.app.showk['loading'].isChecked():
+            p.setFont(QFont('Consolas', 8)); p.setPen(QColor(255, 240, 80))
+            act = self.app.active
+            for c, name, scene, h in self.app.data.loading_zones:
+                if act and self.app.only_zone.isChecked() and scene not in act: continue
+                if abs(c[0] - s['x']) > self.app.range.value() or abs(c[2] - s['z']) > self.app.range.value(): continue
+                q = scr(*c)
+                if q and 0 <= q.x() <= W and 0 <= q.y() <= H: p.drawText(q, name)
         if self.app.show_actors.isChecked():
             p.setFont(QFont('Consolas', 8))
             for name, (x, y, z) in self.app.actor_pos:
@@ -372,6 +392,7 @@ class App(QWidget):
         self.found_keys = self.live_keys = None
         self.live_version, self.actor_objs, self.actor_pos, self.last_scan, self.last_actor_read = 0, {}, [], 0, 0
         self.obj_actors, self.obj_delta, self.obj_version = {}, {}, 0
+        self.manual, self.actor_version, self.detected = None, 0, set()
         lay = QHBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0)
         side = QFrame(); side.setFixedWidth(250); side.setStyleSheet('background:#1b2026; color:#d0d8e0')
         sl = QVBoxLayout(side)
@@ -392,6 +413,9 @@ class App(QWidget):
         self.only_live = QCheckBox('Only things that exist right now'); self.only_live.setChecked(True); sl.addWidget(self.only_live)
         self.only_height = QCheckBox("Only walls right around Link"); sl.addWidget(self.only_height)
         self.no_ceiling = QCheckBox('Hide ceilings (for dungeons)'); self.no_ceiling.setChecked(True); sl.addWidget(self.no_ceiling)
+        self.zone_pick = QComboBox(); self.zone_pick.addItem('Zone: follow the game')
+        for g in self.data.groups: self.zone_pick.addItem(g)
+        self.zone_pick.currentIndexChanged.connect(self.pick_zone); sl.addWidget(self.zone_pick)
         b = QPushButton('Re-detect zone'); b.clicked.connect(self.detect); sl.addWidget(b)
         b = QPushButton('Set romfs folder (for terrain)'); b.clicked.connect(self.pick_romfs); sl.addWidget(b)
         self.range = QSlider(Qt.Horizontal); self.range.setRange(15, 250); self.range.setValue(60)
@@ -403,6 +427,39 @@ class App(QWidget):
         self.view = GLView(self); lay.addWidget(self.view, 1)
         self.timer = QTimer(self); self.timer.timeout.connect(self.tick); self.timer.start(33)
         self.resize(1300, 820)
+
+    def pick_zone(self, i):
+        if i == 0:
+            self.manual = None; self.detect()
+        else:
+            g = self.zone_pick.currentText()
+            self.manual = {s for s in self.data.scene_names if re.sub(r'_(Static|Dynamic)$', '', s) == g}
+            self.active = self.manual
+            self.zone_msg = 'zone (manual): ' + g
+            s = self.state
+            ids = [i for i, n in enumerate(self.data.scene_names) if n in self.manual]
+            c = self.data.wc[np.isin(self.data.ws, ids)]
+            if len(c) and not (self.detected and self.manual & self.detected):
+                cx, cy, cz = np.median(c, 0)
+                self.view.set_mode('free')
+                self.modes.button(3).setChecked(True)
+                self.view.free = [float(cx), float(cy) + 60, float(cz) + 60, 0.0, -0.75]
+
+    def actor_mesh(self):
+        """Collision boxes of live actors at their current positions."""
+        out = []
+        for name, (x, y, z) in self.actor_pos:
+            bb = self.data.actor_boxes.get(name)
+            if not bb: continue
+            lo, hi = np.array(bb[0], np.float32), np.array(bb[1], np.float32)
+            k = np.array([[a, b_, c] for a in (lo[0], hi[0]) for b_ in (lo[1], hi[1]) for c in (lo[2], hi[2])], np.float32) + [x, y, z]
+            faces = [(0, 1, 3, 2), (4, 5, 7, 6), (0, 1, 5, 4), (2, 3, 7, 6), (0, 2, 6, 4), (1, 3, 7, 5)]
+            col = ACTOR_COL.get(name.split('_')[0], QColor('white'))
+            rgb = (col.red(), col.green(), col.blue())
+            for f in faces:
+                q = k[list(f)]
+                out.append(vertices(np.stack([q[[0, 1, 2]], q[[0, 2, 3]]]), rgb, 110))
+        return np.concatenate(out) if out else np.zeros((0, 10), np.float32)
 
     def pick_romfs(self):
         d = QFileDialog.getExistingDirectory(self, 'Game romfs folder (contains Banc, Phive, Pack...)')
@@ -425,23 +482,25 @@ class App(QWidget):
                                            (lambda f: setattr(self, 'zone_msg', 'zone: scanning %d%%' % (f * 100))) if first else None)
                 hit = set(found)
                 ratio = {s: len(hs & hit) / len(hs) for s, hs in self.data.scene_items.items() if hs}
-                areas = {}
-                for s, r in ratio.items(): areas[s.split('_')[0]] = areas.get(s.split('_')[0], 0) + r * len(self.data.scene_items[s])
-                best = max(areas, key=areas.get) if areas and max(areas.values()) > 0 else None
-                act = {s for s, r in ratio.items() if best and s.split('_')[0] == best and r >= 0.25}
+                act = {s for s, r in ratio.items() if r >= 0.9}
+                if not act and ratio and max(ratio.values()) >= 0.5:
+                    best = max(ratio, key=ratio.get)
+                    grp = re.sub(r'_(Static|Dynamic)$', '', best)
+                    act = {s for s in ratio if re.sub(r'_(Static|Dynamic)$', '', s) == grp}
                 live = {}
                 for h, recs in found.items():
                     for r in recs:
                         o = self.game.actor_of(r)
                         if o: live[h] = o; break
-                self.active = act or None
+                self.detected = act
+                if self.manual is None: self.active = act or None
                 self.found_keys = np.array(sorted(hit), np.uint64)
                 self.live_keys = np.array(sorted(live), np.uint64)
                 self.actor_objs = {h: o for h, o in live.items() if h in self.data.actors}
                 self.obj_actors = {h: o for h, o in live.items() if h in self.data.obj_pos}
                 self.live_version += 1
                 self.last_scan = time.time()
-                self.zone_msg = 'zone: %s (%.0fs)' % (', '.join(sorted(act)) if act else 'not found, showing all', time.time() - t)
+                if self.manual is None: self.zone_msg = 'zone: %s (%.0fs)' % (', '.join(sorted(act)) if act else 'not found, showing all', time.time() - t)
             except Exception as e:
                 self.zone_msg = 'zone scan failed: %r' % e
             finally:
@@ -459,7 +518,10 @@ class App(QWidget):
                 QTimer.singleShot(2000, self.detect)
             self.last_pos = (s['x'], s['z'])
             if time.time() - self.last_scan > 20 and not self.scanning: self.detect()
-            if self.show_actors.isChecked() and time.time() - self.last_actor_read > 0.15:
+            elsewhere = self.manual is not None and not (self.manual & self.detected)
+            if elsewhere and self.actor_pos:
+                self.actor_pos = []; self.actor_version += 1
+            if not elsewhere and self.show_actors.isChecked() and time.time() - self.last_actor_read > 0.15:
                 self.last_actor_read = time.time()
                 rng = self.range.value()
                 out = []
@@ -468,6 +530,7 @@ class App(QWidget):
                     if pos and sum(map(abs, pos)) > 0.01 and abs(pos[0] - s["x"]) < rng and abs(pos[2] - s['z']) < rng:
                         out.append((self.data.actors[h], pos))
                 self.actor_pos = out
+                self.actor_version += 1
                 delta, changed = {}, False
                 for h, obj in self.obj_actors.items():
                     pos = self.game.actor_pos(obj)
@@ -501,7 +564,14 @@ def setup(qa):
     return json.load(open(gpath))
 
 
+def log_errors(kind, value, tb):
+    import traceback
+    with open(os.path.join(HERE, 'viewer_error.log'), 'a') as f:
+        f.write(time.strftime('%Y-%m-%d %H:%M:%S ') + ''.join(traceback.format_exception(kind, value, tb)) + '\n')
+
+
 if __name__ == '__main__':
+    sys.excepthook = log_errors
     fmt = QSurfaceFormat(); fmt.setDepthBufferSize(24); fmt.setSamples(4); QSurfaceFormat.setDefaultFormat(fmt)
     qa = QApplication(sys.argv)
     w = App(setup(qa)); w.show()
