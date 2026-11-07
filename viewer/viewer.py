@@ -302,6 +302,10 @@ class GLView(QOpenGLWidget):
         if e.button() == Qt.RightButton:
             self.pick_menu(e)
             return
+        if e.button() == Qt.LeftButton and e.modifiers() & Qt.ControlModifier:
+            h = self.pick(e.position().x(), e.position().y())
+            if h: self.app.toggle_select(h)
+            return
         if e.button() == Qt.LeftButton and self.gizmo_axes:
             x, y = e.position().x(), e.position().y()
             for axis, a, b in self.gizmo_axes:
@@ -404,6 +408,8 @@ class GLView(QOpenGLWidget):
             menu.addSeparator()
             name = self.app.name_of(h) or 'object %x' % h
             menu.addAction('%s' % name).setEnabled(False)
+            menu.addAction('Select all with the same name', lambda: self.app.select_same_name(h))
+            menu.addAction('Add to selection' if h not in self.app.selection else 'Remove from selection', lambda: self.app.toggle_select(h))
             live = self.app.live_actor(h, pt)
             if live:
                 pos = self.app.game.actor_pos(live)
@@ -420,6 +426,7 @@ class GLView(QOpenGLWidget):
                 else:
                     menu.addAction('Disable collision in game', lambda: self.app.set_collision(h, False))
         menu.addSeparator()
+        if self.app.selection: self.app.group_menu(menu)
         if self.app.disabled:
             menu.addAction('Re-enable everything I disabled (%d)' % len(self.app.disabled), self.app.restore_all)
         if self.app.moved:
@@ -640,15 +647,19 @@ class GLView(QOpenGLWidget):
                 if abs(c[0] - s['x']) > self.app.range.value() or abs(c[2] - s['z']) > self.app.range.value(): continue
                 q = scr(*c)
                 if q and 0 <= q.x() <= W and 0 <= q.y() <= H: p.drawText(q, name)
-        sel = self.app.selected
+        sel = set(self.app.selection) | ({self.app.selected} if self.app.selected else set())
         if sel:
             p.setPen(QPen(QColor(255, 255, 0), 1)); p.setBrush(Qt.NoBrush)
+            keys = np.array(sorted(sel), np.uint64)
+            budget = 6000
             for tris, hs in list(self.picks) + list(self.app.dyn_picks):
-                m = hs == sel
+                m = np.isin(hs, keys)
                 if not m.any(): continue
-                for tr in tris[m][:4000]:
+                for tr in tris[m][:budget]:
                     pts = [scr(*v) for v in tr]
                     if all(pts): p.drawPolygon(pts)
+                budget -= int(m.sum())
+                if budget <= 0: break
         self.gizmo_axes = []
         gp = self.app.gizmo_pos()
         if gp is not None:
@@ -694,6 +705,7 @@ GIZMO_LEN = 2.0
 RUNTIME = 0xFFFF000000000000
 SKIP_ACTORS = ('Land_', 'Player', 'Weapon_', 'Armor_', 'Item_Ocarina', 'Camera', 'Event', 'Sound', 'Area', 'Post',
                'Forbid', 'Ground', 'Interest', 'Sky', 'Weather', 'Env', 'Light', 'Fog')
+EFFECT_ACTORS = {'DustArea', 'VolumeFogArea', 'Obj_Gerudo_QuickSand_A_01'}
 LISTED = ('Enemy_', 'Npc_', 'Animal_', 'Obj_', 'Item_', 'DgnObj_', 'FldObj_', 'TBox_', 'Land_')
 SYSTEM_ACTORS = {'Exterminator', 'SootCamera', 'PlayerCamera', 'EventCamera'}
 
@@ -722,6 +734,7 @@ class App(QWidget):
         self.disabled, self.loaded, self.selected = {}, {}, None
         self.moved, self.models, self.gizmo, self.pins, self.live_all, self.live_named, self.runtime = {}, {}, None, {}, {}, {}, {}
         self.target = None
+        self.selection = set()
         try:
             self.hidden_keys = np.array(json.load(open(os.path.join(HERE, 'hidden.json'))), np.uint64)
         except Exception:
@@ -764,6 +777,12 @@ class App(QWidget):
         self.search.textChanged.connect(self.do_search)
         self.search_timer = QTimer(self); self.search_timer.setSingleShot(True); self.search_timer.timeout.connect(lambda: self.do_search(self.search.text()))
         self.results.itemClicked.connect(lambda it: self.go_to(*it.data(Qt.UserRole)))
+        self.results.setSelectionMode(QListWidget.ExtendedSelection)
+        self.results.itemSelectionChanged.connect(self.list_selection)
+        self.results.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.results.customContextMenuRequested.connect(self.list_menu)
+        self.list_hint = QLabel('<small>Ctrl/Shift-click the list or Ctrl-click the map to select several; right-click for actions.</small>')
+        self.list_hint.setWordWrap(True); sl.addWidget(self.list_hint)
         row = QHBoxLayout()
         b = QPushButton('Teleport Link there'); b.clicked.connect(self.teleport_selected); row.addWidget(b)
         b = QPushButton('Kill inv. walls'); b.setToolTip('Disable collision of every invisible wall in this area'); b.clicked.connect(self.disable_all_walls); row.addWidget(b)
@@ -853,7 +872,7 @@ class App(QWidget):
         t = text.strip().lower()
         rows = []
         for name, acts in self.live_named.items():
-            if name.startswith(LISTED) and not name.startswith(SKIP_ACTORS) and t in name.lower():
+            if (name.startswith(LISTED) or name in EFFECT_ACTORS) and not name.startswith(SKIP_ACTORS) and t in name.lower():
                 for a in acts[:50]:
                     p = self.game.actor_pos(a)
                     if p and sum(map(abs, p)) > 0.01:
@@ -865,6 +884,74 @@ class App(QWidget):
                 rows.append(('%s [%s]  %.0f %.0f %.0f' % (name, kind, *c), tuple(map(float, c)), h, QColor(*KCOL[kind][0]) if kind in KCOL else QColor('white')))
         for label, p, h, col in rows[:2000]:
             it = QListWidgetItem(label); it.setData(Qt.UserRole, (p, h)); it.setForeground(col); self.results.addItem(it)
+
+    def toggle_select(self, h):
+        if h in self.selection: self.selection.discard(h)
+        else: self.selection.add(h)
+        self.zone_msg = '%d selected' % len(self.selection)
+
+    def same_name(self, name):
+        hs = set()
+        act = self.active or ()
+        for n, kind, scene, c, h in self.data.items:
+            if n == name and (not act or scene in act): hs.add(h)
+        base = name.replace(' (spawned)', '')
+        owners = {a: h for h, a in self.live_all.items()}
+        for a in self.live_named.get(base, []):
+            hs.add(owners.get(a, RUNTIME | a))
+        for path, (_, recs, ow) in self.data.tile_info.items():
+            for h in ow:
+                if self.data.name_of(h) == base: hs.add(h)
+        return hs
+
+    def select_same_name(self, h):
+        name = self.name_of(h)
+        if not name: return
+        self.selection |= self.same_name(name)
+        self.zone_msg = '%d selected (%s)' % (len(self.selection), name)
+
+    def list_selection(self):
+        items = self.results.selectedItems()
+        if len(items) > 1:
+            self.selection = {it.data(Qt.UserRole)[1] for it in items}
+            self.zone_msg = '%d selected' % len(self.selection)
+
+    def list_menu(self, pos):
+        it = self.results.itemAt(pos)
+        menu = QMenu(self)
+        if it is not None:
+            p, h = it.data(Qt.UserRole)
+            if h not in self.selection: self.selection = {h}
+            menu.addAction('Teleport Link here', lambda: self.teleport(p))
+            menu.addAction('Fly camera here', lambda: self.view.fly_to(p))
+            menu.addAction('Copy coords', lambda: self.copy_coords(p))
+            menu.addAction('Select all with the same name', lambda: self.select_same_name(h))
+            menu.addSeparator()
+        self.group_menu(menu)
+        menu.exec(self.results.mapToGlobal(pos))
+
+    def group_menu(self, menu):
+        hs = sorted(self.selection)
+        n = len(hs)
+        menu.addAction('%d selected' % n).setEnabled(False)
+        menu.addAction('Hide all in game (send away, no collision)', lambda: self.for_all(hs, self.send_away))
+        menu.addAction('Disable collision of all in game', lambda: self.for_all(hs, lambda h: self.set_collision(h, False) if self.baked_tiles(h) else None))
+        menu.addAction('Put all back / re-enable', lambda: self.for_all(hs, self.restore_one))
+        menu.addAction('Hide all in the viewer', lambda: self.for_all(hs, self.hide))
+        menu.addAction('Clear selection', lambda: self.selection.clear())
+
+    def for_all(self, hs, fn):
+        done = 0
+        for h in hs:
+            try:
+                fn(h); done += 1
+            except Exception:
+                pass
+        self.zone_msg = 'applied to %d of %d' % (done, len(hs))
+
+    def restore_one(self, h):
+        if h in self.moved: self.put_back(h)
+        if h in self.disabled: self.set_collision(h, True)
 
     def go_to(self, p, h):
         self.selected = h
@@ -892,14 +979,21 @@ class App(QWidget):
 
     def name_of(self, h):
         if h in self.runtime: return self.runtime[h][1]
+        if h & RUNTIME == RUNTIME:
+            a = h & 0xFFFFFFFFFFFF
+            return next((n for n, acts in self.live_named.items() if a in acts), None)
         return self.data.hash_name.get(h) or self.data.name_of(h)
 
     def live_actor(self, h, near=None):
         """Live actor for a placement id; falls back to the nearest live actor of the same name."""
-        a = self.actor_objs.get(h) or self.obj_actors.get(h) or self.live_all.get(h)
-        if a or near is None: return a
-        name = self.data.hash_name.get(h) or self.data.name_of(h)
         if h in self.runtime: return self.runtime[h][0]
+        if h & RUNTIME == RUNTIME: return h & 0xFFFFFFFFFFFF
+        a = self.actor_objs.get(h) or self.obj_actors.get(h) or self.live_all.get(h)
+        if a: return a
+        if near is None:
+            near = next((c for n, k, s, c, hh in self.data.items if hh == h), None)
+            if near is None: return None
+        name = self.data.hash_name.get(h) or self.data.name_of(h)
         best = None
         for c in self.live_named.get(name, []):
             p = self.game.actor_pos(c)
@@ -1061,7 +1155,7 @@ class App(QWidget):
                     named.setdefault(name, []).append(a)
                     real = h and h != 0xFFFFFFFFFFFFFFFF
                     if real: live.setdefault(h, a)
-                    if real and h in drawn or name.startswith(SKIP_ACTORS) or name in SYSTEM_ACTORS: continue
+                    if real and h in drawn or (name.startswith(SKIP_ACTORS) and name not in EFFECT_ACTORS) or name in SYSTEM_ACTORS: continue
                     p = self.game.actor_pos(a)
                     if not p or sum(map(abs, p)) < 0.01: continue
                     has_model = float(np.min(np.linalg.norm(mp - np.array(p, np.float32), axis=1))) < 1.0
