@@ -20,6 +20,7 @@ KINDS = [  # key, label, rgb, alpha, shown by default
     ('push', 'Push walls (doors etc.)', (64, 160, 255), 80, False),
     ('other', 'Enemy / horse / camera walls', (160, 160, 160), 60, False),
     ('object', 'Objects (pots, chests, blocks...)', (205, 150, 90), 140, True),
+    ('conditional', 'Story-dependent terrain pieces', (120, 200, 255), 70, True),
     ('void', 'Void-out zones', (210, 60, 255), 80, True),
     ('norespawn', 'No-respawn areas', (64, 224, 208), 50, False),
     ('whirlpool', 'Whirlpools', (32, 96, 255), 60, False),
@@ -67,6 +68,7 @@ class Data:
         self.ls, self.lk, self.lss = np.concatenate(segs), np.array(sk), np.array(ss)
         self.lc = self.ls.mean(1)
         self.terrain, self.loading, self.tiles, self.bounds, self.names = {}, set(), {}, {}, {}
+        self.conditional = np.zeros(0, np.uint64)
 
     def terrain_near(self, scenes, x, z, rng):
         out, pending = [], 0
@@ -91,15 +93,19 @@ class Data:
         return out, pending
 
     def names_for(self, scene):
-        """Placement hash -> actor name for every layer of the scene's area (Static/Dynamic, both ages)."""
+        """Placement hash -> actor name for every layer of the scene's area (Static/Dynamic, both ages).
+        Placements with a story-flag condition are collected in self.conditional."""
         area = scene.split('_')[0]
         if area not in self.names:
-            d = {}
+            d, cond = {}, []
             folder = romfs.path('Banc', area)
             for f in os.listdir(folder) if os.path.isdir(folder) else []:
                 if f.endswith('.bcett.byml.zs'):
-                    for a in Byml(romfs.read('Banc', area, f)).root.get('Actors', []): d[a['Hash']] = a.get('Gyaml', '')
+                    for a in Byml(romfs.read('Banc', area, f)).root.get('Actors', []):
+                        d[a['Hash']] = a.get('Gyaml', '')
+                        if a.get('Presence'): cond.append(a['Hash'])
             self.names[area] = d
+            self.conditional = np.union1d(self.conditional, np.array(cond, np.uint64))
         return self.names[area]
 
     def _load(self, path, key, tiles, scene):
@@ -243,6 +249,7 @@ class GLView(QOpenGLWidget):
         key = (round(lx / (rng / 4)), round(lz / (rng / 4)), round(ly / 2) if height or ceil else 0, ceil, rng, tuple(sorted(show.items())),
                app.only_zone.isChecked(), height, tuple(sorted(app.active or ())), len(d.terrain),
                app.only_live.isChecked(), app.live_version)
+        key = key + (len(d.conditional),)
         if key == self.build_key: return
         self.build_key = key
         zone_ids = [i for i, n in enumerate(d.scene_names) if n in (app.active or ())]
@@ -262,7 +269,7 @@ class GLView(QOpenGLWidget):
             return m
         trans, lines, opaque = [], [], []
         for i, k in enumerate(d.kind_names):
-            if k == 'terrain' or not show[k]: continue
+            if k in ('terrain', 'conditional') or not show[k]: continue
             m = sel(d.wc, d.wk, d.ws, i, d.wh)
             if height: m &= near_link(d.wt)
             if m.any(): trans.append(vertices(d.wt[m], *KCOL[k]))
@@ -275,8 +282,11 @@ class GLView(QOpenGLWidget):
             for t, c, h in tl:
                 m = (np.abs(c[:, 0] - lx) < rng) & (np.abs(c[:, 2] - lz) < rng) if len(t) else None
                 if m is not None and ceil: m &= t[:, :, 1].min(1) < ly + 3.5
-                if m is not None and live: m &= (h == 0) | np.isin(h, app.found_keys)
-                if m is not None and m.any(): opaque.append(vertices(t[m], *KCOL['terrain']))
+                if m is None or not m.any(): continue
+                cond = np.isin(h, d.conditional) & m
+                solid = m & ~cond
+                if solid.any(): opaque.append(vertices(t[solid], *KCOL['terrain']))
+                if show['conditional'] and cond.any(): trans.append(vertices(t[cond], *KCOL['conditional']))
         cat = lambda L: np.concatenate(L) if L else np.zeros((0, 10), np.float32)
         self.upload('opaque', cat(opaque)); self.upload('trans', cat(trans)); self.upload('lines', cat(lines))
         if pending: self.build_key = None
